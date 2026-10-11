@@ -41,18 +41,18 @@ Issue #258 outlines the multi-phase run protocol roadmap. Phase 0 delivers the c
   A feature string is added to `features` only when its flags, transport, and runtime semantics are implemented and tested. In Phase 0, no protocol stream features are active, so `features` is an empty array (`[]`). This prevents consumers from assuming event streams or result documents are ready when they are not.
 
 - **D4: Command inventory is derived dynamically and sorted deterministically.**
-  Public commands are extracted directly from the registered Commander program rather than relying on a static array that can silently drift. The resulting array is sorted lexicographically for reproducible output.
+  Public commands are extracted directly from the registered Commander program rather than relying on a static catalog that can silently drift. For Phase 0, the handshake advertises top-level primary command names only; aliases (such as `verify` for `check`) and nested subcommands (e.g. `skill list`, `export bom`) are dispatched under their primary entry points. The resulting array is sorted lexicographically for reproducible output.
 
-- **D5: Isolated subprocess probes with timeout bounds and error sanitization.**
-  Subprocess probes for `kicad-cli`, `git`, and `openspec` use explicit argument lists without shell interpolation and are bounded by a 5000 ms timeout. When a tool is not installed or errors, its entry in `tools` is `null`. Internal error text, stack traces, and local filesystem paths are never leaked into the JSON output.
+- **D5: Isolated subprocess probes with timeout bounds and anchored version parsing.**
+  Subprocess probes for `kicad-cli`, `git`, and `openspec` use explicit argument lists without shell interpolation and are bounded by a 5000 ms deadline (including `kicad-cli` via `kicadCliVersion({ timeout: 5000 })`). When a tool is not installed, times out, or errors, its entry in `tools` is `null`. Probe outputs are strictly validated against anchored version patterns; warning-only output, diagnostic text, stack traces, and local filesystem paths are rejected and never leaked into the JSON output.
 
 - **D6: Dependency injection for test isolation.**
   `collectCapabilities` accepts injectable `CapabilityDeps`, allowing automated unit tests to verify missing-tool scenarios deterministically on any operating system without modifying system PATH.
 
 ## Risks / Trade-offs
 
-- **[Tool probes could hang indefinitely]** -> Resolved by setting a 5-second timeout on all subprocess calls.
-- **[Command inventory drift]** -> Resolved by dynamic extraction from Commander registrations and automated parity tests.
+- **[Tool probes could hang indefinitely]** -> Resolved by enforcing a 5-second deadline on all subprocess calls (`kicad-cli`, `git`, `openspec`), terminating timed-out subprocesses and degrading safely to null.
+- **[Command inventory drift]** -> Resolved by dynamic extraction from Commander registrations and automated parity tests against observed CLI registration.
 - **[Over-promising future capabilities]** -> Resolved by maintaining an empty feature list in Phase 0 until subsequent phases land.
 
 ## Migration Plan

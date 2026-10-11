@@ -682,9 +682,9 @@ Placement, routing, and legibility are computed from the netlist rather than sam
 
 ### AC-17 · `copperhead capabilities` — versioned protocol handshake (Issue #258 Phase 0)
 
-- **AC-17.1 (protocol identifier)** `capabilities --json` emits a JSON document containing `protocol: "copperhead-run/1"`, `cli` version, lexicographically sorted `commands`, `features`, and installed `tools` (`kicadCli`, `git`, `openspec`, `node`).
+- **AC-17.1 (protocol identifier)** `capabilities --json` emits a JSON document containing `protocol: "copperhead-run/1"`, `cli` version, lexicographically sorted top-level primary `commands` (excluding aliases and nested subcommands in Phase 0), `features`, and installed `tools` (`kicadCli`, `git`, `openspec`, `node`).
 - **AC-17.2 (truthful feature advertisement)** In Phase 0, `features` is an empty array (`[]`); unimplemented stream capabilities are not advertised.
-- **AC-17.3 (soft probe degradation)** Missing, unparseable, or erroring tool probes degrade to `null` for that tool (e.g. `kicadCli: null`); probe failures never fail the command or leak host paths / subprocess errors.
+- **AC-17.3 (soft probe degradation)** Missing, unparseable, erroring, or timed-out (5000 ms deadline) tool probes degrade to `null` for that tool (e.g. `kicadCli: null`); probe failures never fail the command or leak host paths / subprocess diagnostics.
 - **AC-17.4 (offline and repo-independent)** `capabilities --json` requires no git repository, no KiCad project, no model API credentials, and makes zero network calls. It leaves filesystem state completely unmodified.
 - **AC-17.5 (consumer protocol compatibility)** A consumer expecting major 1 accepts `copperhead-run/1` and refuses unknown majors (e.g. `copperhead-run/2`); unknown JSON fields are ignored for forward compatibility.
 

@@ -209,13 +209,13 @@ function fallbackAfterMissing(): string {
   throw new KicadCliMissingError();
 }
 
-async function runKicad(args: string[], opts?: { reject?: boolean }): Promise<Awaited<ReturnType<typeof execa>>> {
+async function runKicad(args: string[], opts?: { reject?: boolean; timeout?: number }): Promise<Awaited<ReturnType<typeof execa>>> {
   let bin = resolveKicadCli();
-  let res = await execa(bin, args, { reject: false });
+  let res = await execa(bin, args, { reject: false, timeout: opts?.timeout });
   if (res.failed && isNotFoundError(res)) {
     if (bin === 'kicad-cli') {
       bin = fallbackAfterMissing();
-      res = await execa(bin, args, { reject: false });
+      res = await execa(bin, args, { reject: false, timeout: opts?.timeout });
     } else {
       throw new KicadCliMissingError();
     }
@@ -254,8 +254,12 @@ export function setKicadFallbackWinRoots(roots?: readonly string[]): void {
   fallbackBinariesOverride = null;
 }
 
-export async function kicadCliVersion(): Promise<string> {
-  const res = await runKicad(['version']);
+export interface KicadCliVersionOptions {
+  timeout?: number;
+}
+
+export async function kicadCliVersion(opts?: KicadCliVersionOptions): Promise<string> {
+  const res = await runKicad(['version'], opts);
   return String(res.stdout ?? '').trim();
 }
 

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { mkdtemp, readdir, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, rm, writeFile, chmod } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -9,24 +9,46 @@ import {
   COPPERHEAD_RUN_PROTOCOL,
   SUPPORTED_PROTOCOL_MAJOR,
   IMPLEMENTED_PROTOCOL_FEATURES,
-  CANONICAL_PUBLIC_COMMANDS,
+  DEFAULT_PROBE_TIMEOUT_MS,
   collectCapabilities,
   isProtocolCompatible,
   assertProtocolCompatible,
   formatCapabilities,
+  parseKicadVersion,
+  parseGitVersion,
+  parseOpenspecVersion,
+  extractPublicCommands,
   type CapabilityReport,
   type CapabilityDeps,
 } from '../src/commands/capabilities.js';
 import { runDoctor } from '../src/commands/doctor.js';
+import { resetKicadCliCache } from '../src/kicad/cli.js';
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const DIST_CLI = path.join(ROOT, 'dist', 'cli.js');
 const SRC_CLI = path.join(ROOT, 'src', 'cli.ts');
+const TSX_CLI = path.join(ROOT, 'node_modules', 'tsx', 'dist', 'cli.mjs');
+
+/**
+ * Standard hermetic unit-test dependencies that provide deterministic
+ * stubbed responses for all external probes without spawning host binaries.
+ */
+function mockUnitDeps(over: Partial<CapabilityDeps> = {}): CapabilityDeps {
+  return {
+    nodeVersion: 'v20.19.0',
+    cliVersion: '0.11.0',
+    kicadVersion: async () => '10.0.4',
+    gitVersion: async () => '2.43.0',
+    openspecVersion: async () => '1.14.1',
+    ...over,
+  };
+}
 
 describe('protocol constant and version semantics', () => {
   it('defines the protocol identifier as copperhead-run/1', () => {
     expect(COPPERHEAD_RUN_PROTOCOL).toBe('copperhead-run/1');
     expect(SUPPORTED_PROTOCOL_MAJOR).toBe(1);
+    expect(DEFAULT_PROBE_TIMEOUT_MS).toBe(5000);
   });
 
   it('advertises an empty feature array in Phase 0 (truthfulness invariant)', () => {
@@ -40,31 +62,35 @@ describe('protocol constant and version semantics', () => {
     expect(IMPLEMENTED_PROTOCOL_FEATURES).not.toContain('control');
   });
 
-  it('accepts matching protocol major 1', () => {
+  it('accepts matching protocol major 1 with valid formats', () => {
     expect(isProtocolCompatible('copperhead-run/1')).toBe(true);
     expect(isProtocolCompatible('copperhead-run/1.0')).toBe(true);
     expect(isProtocolCompatible('copperhead-run/1.4')).toBe(true);
   });
 
-  it('rejects unknown protocol major or non-matching protocol strings', () => {
+  it('strictly rejects malformed protocol strings, leading zeros, and invalid suffixes', () => {
+    expect(isProtocolCompatible('copperhead-run/01')).toBe(false);
+    expect(isProtocolCompatible('copperhead-run/1.anything')).toBe(false);
     expect(isProtocolCompatible('copperhead-run/2')).toBe(false);
     expect(isProtocolCompatible('copperhead-run/0')).toBe(false);
     expect(isProtocolCompatible('copperhead-run/3.0')).toBe(false);
     expect(isProtocolCompatible('other-protocol/1')).toBe(false);
     expect(isProtocolCompatible('')).toBe(false);
     expect(isProtocolCompatible('copperhead-run')).toBe(false);
+    expect(isProtocolCompatible('copperhead-run/')).toBe(false);
+    expect(isProtocolCompatible('copperhead-run/1.2.3')).toBe(false);
   });
 
-  it('assertProtocolCompatible accepts valid report and rejects unknown major', () => {
+  it('assertProtocolCompatible accepts valid report and rejects unknown major or invalid input', () => {
     const validReport: CapabilityReport = {
       protocol: 'copperhead-run/1',
       cli: '0.11.0',
       commands: ['check', 'do'],
       features: [],
       tools: {
-        kicadCli: '9.0.1',
+        kicadCli: '10.0.4',
         git: '2.43.0',
-        openspec: '1.6.0',
+        openspec: '1.14.1',
         node: process.version,
       },
     };
@@ -81,6 +107,16 @@ describe('protocol constant and version semantics', () => {
 
     expect(() =>
       assertProtocolCompatible({ ...validReport, protocol: 'unknown-protocol/1' }, 1),
+    ).toThrow(/unsupported protocol version/i);
+
+    // Structural negative assertions against null, non-objects, and missing protocol field
+    expect(() => assertProtocolCompatible(null, 1)).toThrow(/unsupported protocol version/i);
+    expect(() => assertProtocolCompatible(undefined, 1)).toThrow(/unsupported protocol version/i);
+    expect(() => assertProtocolCompatible({} as unknown as CapabilityReport, 1)).toThrow(
+      /unsupported protocol version/i,
+    );
+    expect(() =>
+      assertProtocolCompatible('not-a-report' as unknown as CapabilityReport, 1),
     ).toThrow(/unsupported protocol version/i);
   });
 
@@ -104,17 +140,90 @@ describe('protocol constant and version semantics', () => {
   });
 });
 
-describe('collectCapabilities with dependency injection', () => {
+describe('tool output version parsers', () => {
+  describe('parseKicadVersion', () => {
+    it('parses valid KiCad CLI version strings', () => {
+      expect(parseKicadVersion('10.0.4')).toBe('10.0.4');
+      expect(parseKicadVersion('kicad-cli 9.0.1')).toBe('9.0.1');
+      expect(parseKicadVersion('kicad-cli v8.0.4')).toBe('8.0.4');
+      expect(parseKicadVersion('10.0.5-rc1')).toBe('10.0.5-rc1');
+      expect(parseKicadVersion('8.0.4+extra')).toBe('8.0.4+extra');
+    });
+
+    it('extracts version when preceded by diagnostic or warning lines', () => {
+      expect(parseKicadVersion('OpenGL 3.2 unsupported\n10.0.4')).toBe('10.0.4');
+      expect(parseKicadVersion('Gtk-Message: Failed to load module\nkicad-cli 9.0.1\n')).toBe(
+        '9.0.1',
+      );
+    });
+
+    it('returns null on empty, whitespace, or non-string input', () => {
+      expect(parseKicadVersion('')).toBeNull();
+      expect(parseKicadVersion('   \n  ')).toBeNull();
+      expect(parseKicadVersion(null)).toBeNull();
+      expect(parseKicadVersion(undefined)).toBeNull();
+    });
+
+    it('returns null and never leaks host filepaths from warning-only or malformed output', () => {
+      const leakedPath =
+        'WARNING: could not read C:\\Users\\victim\\AppData\\Roaming\\kicad\\secret-config.json';
+      expect(parseKicadVersion(leakedPath)).toBeNull();
+      expect(parseKicadVersion('C:\\Program Files\\KiCad\\bin\\kicad-cli.exe')).toBeNull();
+      expect(parseKicadVersion('/usr/bin/kicad-cli')).toBeNull();
+      expect(parseKicadVersion('kicad-cli: command not found')).toBeNull();
+      expect(parseKicadVersion('Segmentation fault (core dumped)')).toBeNull();
+    });
+  });
+
+  describe('parseGitVersion', () => {
+    it('parses valid Git version strings including platform builds', () => {
+      expect(parseGitVersion('git version 2.43.0')).toBe('2.43.0');
+      expect(parseGitVersion('git version 2.52.0.windows.1')).toBe('2.52.0.windows.1');
+      expect(parseGitVersion('git version 2.39.3 (Apple Git-146)')).toBe('2.39.3');
+      expect(parseGitVersion('git version 2.40.0.vfs.0.4')).toBe('2.40.0.vfs.0.4');
+    });
+
+    it('returns null on empty, warning-only, or host-path output', () => {
+      expect(parseGitVersion('')).toBeNull();
+      expect(parseGitVersion('   ')).toBeNull();
+      expect(parseGitVersion(null)).toBeNull();
+      expect(parseGitVersion('warning: LF will be replaced by CRLF in file')).toBeNull();
+      expect(parseGitVersion('fatal: not a git repository')).toBeNull();
+      expect(parseGitVersion('git version /usr/local/bin/git')).toBeNull();
+      expect(parseGitVersion('C:\\Program Files\\Git\\bin\\git.exe')).toBeNull();
+    });
+  });
+
+  describe('parseOpenspecVersion', () => {
+    it('parses valid OpenSpec version strings', () => {
+      expect(parseOpenspecVersion('1.14.1')).toBe('1.14.1');
+      expect(parseOpenspecVersion('openspec 1.8.0')).toBe('1.8.0');
+      expect(parseOpenspecVersion('v1.14.1')).toBe('1.14.1');
+      expect(parseOpenspecVersion('openspec v1.10.0-beta.2')).toBe('1.10.0-beta.2');
+    });
+
+    it('returns null on empty, warning-only, or host-path output', () => {
+      expect(parseOpenspecVersion('')).toBeNull();
+      expect(parseOpenspecVersion('   ')).toBeNull();
+      expect(parseOpenspecVersion(null)).toBeNull();
+      expect(parseOpenspecVersion('warning: update available from 1.10.0 to 1.14.1')).toBeNull();
+      expect(parseOpenspecVersion('node: internal/modules/cjs/loader: not found')).toBeNull();
+      expect(parseOpenspecVersion('C:\\Users\\dev\\AppData\\Roaming\\npm\\openspec')).toBeNull();
+    });
+  });
+});
+
+describe('hermetic collectCapabilities with injected dependencies', () => {
   it('returns well-formed schema when all tools report versions', async () => {
-    const mockDeps: CapabilityDeps = {
+    const deps = mockUnitDeps({
       nodeVersion: 'v20.19.0',
       cliVersion: '0.11.0',
-      kicadVersion: async () => '9.0.1',
+      kicadVersion: async () => '10.0.4',
       gitVersion: async () => '2.43.0',
-      openspecVersion: async () => '1.6.0',
-    };
+      openspecVersion: async () => '1.14.1',
+    });
 
-    const report = await collectCapabilities({ deps: mockDeps, commands: ['check', 'do'] });
+    const report = await collectCapabilities({ deps, commands: ['check', 'do'] });
 
     expect(report).toEqual({
       protocol: 'copperhead-run/1',
@@ -122,64 +231,41 @@ describe('collectCapabilities with dependency injection', () => {
       commands: ['check', 'do'],
       features: [],
       tools: {
-        kicadCli: '9.0.1',
+        kicadCli: '10.0.4',
         git: '2.43.0',
-        openspec: '1.6.0',
+        openspec: '1.14.1',
         node: 'v20.19.0',
       },
     });
   });
 
-  it('reports missing kicadCli as null without failing (missing KiCad test)', async () => {
-    const mockDeps: CapabilityDeps = {
-      nodeVersion: 'v20.19.0',
-      cliVersion: '0.11.0',
-      kicadVersion: async () => null,
-      gitVersion: async () => '2.43.0',
-      openspecVersion: async () => '1.6.0',
-    };
-
-    const report = await collectCapabilities({ deps: mockDeps, commands: ['check'] });
+  it('reports missing kicadCli as null without failing', async () => {
+    const deps = mockUnitDeps({ kicadVersion: async () => null });
+    const report = await collectCapabilities({ deps, commands: ['check'] });
     expect(report.tools.kicadCli).toBeNull();
     expect(report.tools.git).toBe('2.43.0');
-    expect(report.tools.openspec).toBe('1.6.0');
+    expect(report.tools.openspec).toBe('1.14.1');
     expect(report.protocol).toBe('copperhead-run/1');
   });
 
-  it('reports missing git as null without failing (missing Git test)', async () => {
-    const mockDeps: CapabilityDeps = {
-      nodeVersion: 'v20.19.0',
-      cliVersion: '0.11.0',
-      kicadVersion: async () => '9.0.1',
-      gitVersion: async () => null,
-      openspecVersion: async () => '1.6.0',
-    };
-
-    const report = await collectCapabilities({ deps: mockDeps, commands: ['check'] });
+  it('reports missing git as null without failing', async () => {
+    const deps = mockUnitDeps({ gitVersion: async () => null });
+    const report = await collectCapabilities({ deps, commands: ['check'] });
     expect(report.tools.git).toBeNull();
-    expect(report.tools.kicadCli).toBe('9.0.1');
+    expect(report.tools.kicadCli).toBe('10.0.4');
     expect(report.protocol).toBe('copperhead-run/1');
   });
 
-  it('reports missing openspec as null without failing (missing OpenSpec test)', async () => {
-    const mockDeps: CapabilityDeps = {
-      nodeVersion: 'v20.19.0',
-      cliVersion: '0.11.0',
-      kicadVersion: async () => '9.0.1',
-      gitVersion: async () => '2.43.0',
-      openspecVersion: async () => null,
-    };
-
-    const report = await collectCapabilities({ deps: mockDeps, commands: ['check'] });
+  it('reports missing openspec as null without failing', async () => {
+    const deps = mockUnitDeps({ openspecVersion: async () => null });
+    const report = await collectCapabilities({ deps, commands: ['check'] });
     expect(report.tools.openspec).toBeNull();
-    expect(report.tools.kicadCli).toBe('9.0.1');
+    expect(report.tools.kicadCli).toBe('10.0.4');
     expect(report.protocol).toBe('copperhead-run/1');
   });
 
   it('isolates probe exceptions and never leaks host paths or stack traces', async () => {
-    const mockDeps: CapabilityDeps = {
-      nodeVersion: 'v20.19.0',
-      cliVersion: '0.11.0',
+    const deps = mockUnitDeps({
       kicadVersion: async () => {
         throw new Error('Command failed: /home/user/private/bin/kicad-cli (ENOENT)');
       },
@@ -189,33 +275,29 @@ describe('collectCapabilities with dependency injection', () => {
       openspecVersion: async () => {
         throw new Error('spawn openspec ENOENT');
       },
-    };
+    });
 
-    const report = await collectCapabilities({ deps: mockDeps, commands: ['check'] });
+    const report = await collectCapabilities({ deps, commands: ['check'] });
     expect(report.tools.kicadCli).toBeNull();
     expect(report.tools.git).toBeNull();
     expect(report.tools.openspec).toBeNull();
     expect(report.tools.node).toBe('v20.19.0');
 
-    // Ensure no error strings leaked into JSON payload
     const jsonStr = JSON.stringify(report);
     expect(jsonStr).not.toContain('private');
     expect(jsonStr).not.toContain('ENOENT');
   });
 
   it('sorts commands deterministically across invocations', async () => {
-    const mockDeps: CapabilityDeps = {
-      nodeVersion: 'v20.19.0',
-      cliVersion: '0.11.0',
-    };
+    const deps = mockUnitDeps();
 
     const report1 = await collectCapabilities({
-      deps: mockDeps,
+      deps,
       commands: ['sync', 'check', 'do', 'init', 'doctor'],
     });
 
     const report2 = await collectCapabilities({
-      deps: mockDeps,
+      deps,
       commands: ['do', 'doctor', 'check', 'sync', 'init'],
     });
 
@@ -224,33 +306,165 @@ describe('collectCapabilities with dependency injection', () => {
     expect(report1.commands).toEqual(report2.commands);
   });
 
-  it('dynamically extracts public command names from a Commander program', async () => {
+  it('dynamically extracts public command names from a Commander program and filters internal/help', () => {
     const prog = new Command();
     prog.command('check').description('check command');
     prog.command('do').description('do command');
     prog.command('capabilities').description('capabilities command');
+    prog.command('_internal').description('hidden command');
+    prog.command('help').description('built-in help');
 
-    const report = await collectCapabilities({ program: prog });
-    expect(report.commands).toEqual(['capabilities', 'check', 'do']);
+    const commands = extractPublicCommands(prog);
+    expect(commands).toEqual(['capabilities', 'check', 'do']);
+    expect(commands).not.toContain('_internal');
+    expect(commands).not.toContain('help');
   });
 
-  it('guarantees parity between canonical command catalog and default output', async () => {
-    const report = await collectCapabilities();
-    expect(report.commands).toEqual([...CANONICAL_PUBLIC_COMMANDS].sort());
-    expect(report.commands).toContain('capabilities');
-    expect(report.commands).toContain('check');
-    expect(report.commands).toContain('create');
-    expect(report.commands).toContain('demo');
-    expect(report.commands).toContain('do');
-    expect(report.commands).toContain('doctor');
-    expect(report.commands).toContain('draft');
-    expect(report.commands).toContain('export');
-    expect(report.commands).toContain('init');
-    expect(report.commands).toContain('mcp');
-    expect(report.commands).toContain('repl');
-    expect(report.commands).toContain('score');
-    expect(report.commands).toContain('skill');
-    expect(report.commands).toContain('sync');
+  it('returns empty array when neither program nor explicit commands are given', () => {
+    expect(extractPublicCommands()).toEqual([]);
+  });
+});
+
+describe('subprocess adapter and probe deadline enforcement', () => {
+  it('degrades to null when KiCad probe execution exceeds deadline', async () => {
+    // Configurable short timeout of 200ms with a delayed executable
+    const scratchDir = await mkdtemp(path.join(tmpdir(), 'copperhead-hang-test-'));
+    const isWin = process.platform === 'win32';
+    const fakeKicad = path.join(scratchDir, isWin ? 'fake-kicad.cmd' : 'fake-kicad.sh');
+
+    if (isWin) {
+      await writeFile(
+        fakeKicad,
+        '@node -e "setTimeout(() => console.log(\'10.0.4\'), 3000)"\n',
+        'utf8',
+      );
+    } else {
+      await writeFile(
+        fakeKicad,
+        '#!/bin/sh\nsleep 3\necho "10.0.4"\n',
+        'utf8',
+      );
+      await chmod(fakeKicad, 0o755);
+    }
+
+    const savedEnv = process.env.COPPERHEAD_KICAD_CLI;
+    try {
+      process.env.COPPERHEAD_KICAD_CLI = fakeKicad;
+      resetKicadCliCache();
+      // collectCapabilities with short timeout of 200ms
+      const report = await collectCapabilities({
+        timeoutMs: 200,
+        commands: ['check'],
+        deps: {
+          nodeVersion: 'v20.19.0',
+          cliVersion: '0.11.0',
+          gitVersion: async () => '2.43.0',
+          openspecVersion: async () => '1.14.1',
+        },
+      });
+
+      // Must degrade to null on timeout rather than hanging
+      expect(report.tools.kicadCli).toBeNull();
+      expect(report.tools.git).toBe('2.43.0');
+    } finally {
+      if (savedEnv !== undefined) {
+        process.env.COPPERHEAD_KICAD_CLI = savedEnv;
+      } else {
+        delete process.env.COPPERHEAD_KICAD_CLI;
+      }
+      resetKicadCliCache();
+      await rm(scratchDir, { recursive: true, force: true });
+    }
+  });
+
+  it('real executable probe adapter rejects host paths and unparseable stdout', async () => {
+    const scratchDir = await mkdtemp(path.join(tmpdir(), 'copperhead-leak-test-'));
+    const isWin = process.platform === 'win32';
+    const fakeKicad = path.join(scratchDir, isWin ? 'fake-kicad.cmd' : 'fake-kicad.sh');
+
+    const warningOutput =
+      'WARNING: could not read /root/private/secret-credentials.json\n';
+    if (isWin) {
+      await writeFile(
+        fakeKicad,
+        `@echo ${warningOutput}`,
+        'utf8',
+      );
+    } else {
+      await writeFile(
+        fakeKicad,
+        `#!/bin/sh\necho "${warningOutput}"\n`,
+        'utf8',
+      );
+      await chmod(fakeKicad, 0o755);
+    }
+
+    const savedEnv = process.env.COPPERHEAD_KICAD_CLI;
+    try {
+      process.env.COPPERHEAD_KICAD_CLI = fakeKicad;
+      resetKicadCliCache();
+      const report = await collectCapabilities({
+        commands: ['check'],
+        deps: {
+          nodeVersion: 'v20.19.0',
+          cliVersion: '0.11.0',
+          gitVersion: async () => '2.43.0',
+          openspecVersion: async () => '1.14.1',
+        },
+      });
+
+      expect(report.tools.kicadCli).toBeNull();
+      const serialized = JSON.stringify(report);
+      expect(serialized).not.toContain('secret-credentials');
+      expect(serialized).not.toContain('private');
+    } finally {
+      if (savedEnv !== undefined) {
+        process.env.COPPERHEAD_KICAD_CLI = savedEnv;
+      } else {
+        delete process.env.COPPERHEAD_KICAD_CLI;
+      }
+      resetKicadCliCache();
+      await rm(scratchDir, { recursive: true, force: true });
+    }
+  });
+
+  it('real executable probe adapter successfully returns normalized version from responsive executable', async () => {
+    const scratchDir = await mkdtemp(path.join(tmpdir(), 'copperhead-fast-test-'));
+    const isWin = process.platform === 'win32';
+    const fakeKicad = path.join(scratchDir, isWin ? 'fake-kicad.cmd' : 'fake-kicad.sh');
+
+    if (isWin) {
+      await writeFile(fakeKicad, '@echo kicad-cli 10.0.4\n', 'utf8');
+    } else {
+      await writeFile(fakeKicad, '#!/bin/sh\necho "kicad-cli 10.0.4"\n', 'utf8');
+      await chmod(fakeKicad, 0o755);
+    }
+
+    const savedEnv = process.env.COPPERHEAD_KICAD_CLI;
+    try {
+      process.env.COPPERHEAD_KICAD_CLI = fakeKicad;
+      resetKicadCliCache();
+      const report = await collectCapabilities({
+        timeoutMs: 2000,
+        commands: ['check'],
+        deps: {
+          nodeVersion: 'v20.19.0',
+          cliVersion: '0.11.0',
+          gitVersion: async () => '2.43.0',
+          openspecVersion: async () => '1.14.1',
+        },
+      });
+
+      expect(report.tools.kicadCli).toBe('10.0.4');
+    } finally {
+      if (savedEnv !== undefined) {
+        process.env.COPPERHEAD_KICAD_CLI = savedEnv;
+      } else {
+        delete process.env.COPPERHEAD_KICAD_CLI;
+      }
+      resetKicadCliCache();
+      await rm(scratchDir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -262,9 +476,9 @@ describe('formatCapabilities human output', () => {
       commands: ['check', 'do', 'create'],
       features: [],
       tools: {
-        kicadCli: '9.0.1',
+        kicadCli: '10.0.4',
         git: '2.43.0',
-        openspec: '1.6.0',
+        openspec: '1.14.1',
         node: 'v20.19.0',
       },
     };
@@ -273,8 +487,9 @@ describe('formatCapabilities human output', () => {
     expect(formatted).toContain('copperhead-run/1');
     expect(formatted).toContain('0.11.0');
     expect(formatted).toContain('check, do, create');
-    expect(formatted).toContain('9.0.1');
+    expect(formatted).toContain('10.0.4');
     expect(formatted).toContain('2.43.0');
+    expect(formatted).toContain('1.14.1');
   });
 
   it('formats missing tools cleanly as not found / none', () => {
@@ -345,7 +560,7 @@ describe('real CLI process execution (published build and source entry point)', 
     } finally {
       await rm(scratchDir, { recursive: true, force: true });
     }
-  }, 60_000);
+  });
 
   it('runs cleanly without any model API keys or credentials in environment', async () => {
     const scratchDir = await mkdtemp(path.join(tmpdir(), 'copperhead-cap-no-keys-'));
@@ -368,7 +583,7 @@ describe('real CLI process execution (published build and source entry point)', 
     } finally {
       await rm(scratchDir, { recursive: true, force: true });
     }
-  }, 60_000);
+  });
 
   it('shows capabilities in help output of published build', async () => {
     const res = await execa(process.execPath, [DIST_CLI, '--help'], {
@@ -379,7 +594,7 @@ describe('real CLI process execution (published build and source entry point)', 
 
     expect(res.exitCode).toBe(0);
     expect(res.stdout).toContain('capabilities');
-  }, 60_000);
+  });
 
   it('prints human summary when invoked without --json', async () => {
     const res = await execa(process.execPath, [DIST_CLI, 'capabilities'], {
@@ -391,16 +606,72 @@ describe('real CLI process execution (published build and source entry point)', 
     expect(res.exitCode).toBe(0);
     expect(res.stdout).toContain('copperhead-run/1');
     expect(res.stdout).toContain('Protocol:');
-  }, 60_000);
+  });
 
-  it('guarantees build versus source CLI semantic parity', async () => {
+  it('structurally rejects unimplemented protocol options in Phase 0', async () => {
+    const streamRes = await execa(process.execPath, [DIST_CLI, 'capabilities', '--event-stream'], {
+      cwd: ROOT,
+      reject: false,
+      env: { NO_COLOR: '1', PATH: process.env.PATH },
+    });
+    expect(streamRes.exitCode).not.toBe(0);
+    expect(streamRes.stderr).toMatch(/unknown option/i);
+
+    const resultRes = await execa(process.execPath, [DIST_CLI, 'capabilities', '--result'], {
+      cwd: ROOT,
+      reject: false,
+      env: { NO_COLOR: '1', PATH: process.env.PATH },
+    });
+    expect(resultRes.exitCode).not.toBe(0);
+    expect(resultRes.stderr).toMatch(/unknown option/i);
+  });
+
+  it('derives expected commands independently from observed CLI registration and guarantees parity', async () => {
+    // Read actual CLI help output to derive registered public primary command set
+    const helpRes = await execa(process.execPath, [DIST_CLI, '--help'], {
+      cwd: ROOT,
+      reject: false,
+      env: { NO_COLOR: '1', PATH: process.env.PATH },
+    });
+    expect(helpRes.exitCode).toBe(0);
+
+    const observedCommands: string[] = [];
+    const lines = helpRes.stdout.split('\n');
+    const cmdSectionIndex = lines.findIndex((l) => l.trim() === 'Commands:');
+    expect(cmdSectionIndex).toBeGreaterThan(-1);
+
+    for (let i = cmdSectionIndex + 1; i < lines.length; i++) {
+      const line = lines[i];
+      // Match command definition line: indentation followed by command name (with optional aliases and arguments)
+      const match = line.match(
+        /^ {2}([a-z0-9_-]+)(?:\|[a-z0-9_-]+)?(?:\s+\[[^\]]+\]|\s+<[^>]+>)*\s{2,}/,
+      );
+      if (match && match[1] !== 'help') {
+        observedCommands.push(match[1]);
+      }
+    }
+    const expectedSorted = [...observedCommands].sort();
+
+    // Verify capabilities --json descriptor matches the independently observed command set exactly
+    const capRes = await execa(process.execPath, [DIST_CLI, 'capabilities', '--json'], {
+      cwd: ROOT,
+      reject: false,
+      env: { NO_COLOR: '1', PATH: process.env.PATH },
+    });
+    expect(capRes.exitCode).toBe(0);
+
+    const parsed = JSON.parse(capRes.stdout) as CapabilityReport;
+    expect(parsed.commands).toEqual(expectedSorted);
+  });
+
+  it('guarantees build versus source CLI semantic parity using direct tsx execution', async () => {
     const distRes = await execa(process.execPath, [DIST_CLI, 'capabilities', '--json'], {
       cwd: ROOT,
       reject: false,
       env: { NO_COLOR: '1', PATH: process.env.PATH },
     });
 
-    const srcRes = await execa('npx', ['tsx', SRC_CLI, 'capabilities', '--json'], {
+    const srcRes = await execa(process.execPath, [TSX_CLI, SRC_CLI, 'capabilities', '--json'], {
       cwd: ROOT,
       reject: false,
       env: { NO_COLOR: '1', PATH: process.env.PATH },
@@ -420,5 +691,5 @@ describe('real CLI process execution (published build and source entry point)', 
     expect(distJson.tools.kicadCli).toBe(srcJson.tools.kicadCli);
     expect(distJson.tools.git).toBe(srcJson.tools.git);
     expect(distJson.tools.openspec).toBe(srcJson.tools.openspec);
-  }, 60_000);
+  });
 });

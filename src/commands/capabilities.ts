@@ -28,25 +28,9 @@ export const SUPPORTED_PROTOCOL_MAJOR = 1;
 export const IMPLEMENTED_PROTOCOL_FEATURES: readonly string[] = [];
 
 /**
- * Canonical public commands provided by the Copperhead CLI.
- * Kept sorted lexicographically for determinism.
+ * Default deadline for external tool subprocess version probes (milliseconds).
  */
-export const CANONICAL_PUBLIC_COMMANDS: readonly string[] = [
-  'capabilities',
-  'check',
-  'create',
-  'demo',
-  'do',
-  'doctor',
-  'draft',
-  'export',
-  'init',
-  'mcp',
-  'repl',
-  'score',
-  'skill',
-  'sync',
-];
+export const DEFAULT_PROBE_TIMEOUT_MS = 5000;
 
 export interface ToolVersions {
   kicadCli: string | null;
@@ -69,6 +53,7 @@ export interface CapabilityDeps {
   kicadVersion?: () => Promise<string | null>;
   gitVersion?: () => Promise<string | null>;
   openspecVersion?: () => Promise<string | null>;
+  timeoutMs?: number;
 }
 
 function ownVersion(): string {
@@ -85,25 +70,73 @@ async function probeSafe<T>(fn: () => Promise<T> | T): Promise<T | null> {
   }
 }
 
-function defaultDeps(): CapabilityDeps {
+/**
+ * Parse and validate KiCad CLI version output.
+ * Returns the normalized semantic version string, or null if the output is missing,
+ * malformed, contains only warnings, or contains unparseable text.
+ * Strictly anchored to prevent host filepaths or diagnostic output from leaking.
+ */
+export function parseKicadVersion(raw: string | null | undefined): string | null {
+  if (!raw || typeof raw !== 'string') return null;
+  const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  for (const line of lines) {
+    const match = line.match(/^(?:kicad-cli\s+)?v?(\d+\.\d+(?:\.\d+)?(?:[-+][a-zA-Z0-9._-]+)?)$/i);
+    if (match) {
+      return match[1]!;
+    }
+  }
+  return null;
+}
+
+/**
+ * Parse and validate Git version output.
+ * Supports standard semantic versions as well as platform builds like `2.52.0.windows.1`.
+ * Returns null for unparseable output, warnings, or missing version.
+ */
+export function parseGitVersion(raw: string | null | undefined): string | null {
+  if (!raw || typeof raw !== 'string') return null;
+  const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  for (const line of lines) {
+    const match = line.match(/^git version\s+([0-9]+\.[0-9]+(?:\.[0-9a-zA-Z._-]+)*)/i);
+    if (match) {
+      return match[1]!;
+    }
+  }
+  return null;
+}
+
+/**
+ * Parse and validate OpenSpec CLI version output.
+ * Returns the normalized version string or null for invalid/warning-only output.
+ */
+export function parseOpenspecVersion(raw: string | null | undefined): string | null {
+  if (!raw || typeof raw !== 'string') return null;
+  const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  for (const line of lines) {
+    const match = line.match(/^(?:openspec\s+)?v?(\d+\.\d+(?:\.\d+)?(?:[-+][a-zA-Z0-9._-]+)?)$/i);
+    if (match) {
+      return match[1]!;
+    }
+  }
+  return null;
+}
+
+export function defaultDeps(timeoutMs = DEFAULT_PROBE_TIMEOUT_MS): CapabilityDeps {
   return {
     nodeVersion: process.version,
     cliVersion: ownVersion(),
+    timeoutMs,
     kicadVersion: async () => {
-      const raw = await kicadCliVersion();
-      if (!raw) return null;
-      const match = raw.match(/(?:^|\n)\s*(?:kicad-cli\s+)?v?(\d+\.\d+(?:\.\d+)?)/m);
-      return match ? match[1]! : raw.trim();
+      const raw = await kicadCliVersion({ timeout: timeoutMs });
+      return parseKicadVersion(raw);
     },
     gitVersion: async () => {
-      const { stdout } = await execFileP('git', ['--version'], { timeout: 5000 });
-      const trimmed = stdout.trim().replace(/^git version\s+/, '');
-      return trimmed || null;
+      const { stdout } = await execFileP('git', ['--version'], { timeout: timeoutMs });
+      return parseGitVersion(stdout);
     },
     openspecVersion: async () => {
-      const { stdout } = await execa('openspec', ['--version'], { timeout: 5000 });
-      const trimmed = stdout.trim();
-      return trimmed || null;
+      const { stdout } = await execa('openspec', ['--version'], { timeout: timeoutMs });
+      return parseOpenspecVersion(stdout);
     },
   };
 }
@@ -112,10 +145,14 @@ export interface CollectCapabilitiesOptions {
   deps?: CapabilityDeps;
   program?: Command;
   commands?: string[];
+  timeoutMs?: number;
 }
 
 /**
- * Extract public top-level commands from a Commander instance or command array.
+ * Extract public top-level commands from a Commander instance or explicit command array.
+ * Phase 0 contract: advertises top-level primary command names only, sorted lexicographically.
+ * Aliases (e.g. `verify` for `check`) and subcommands (e.g. `skill list`, `export bom`)
+ * are excluded from the root command inventory and handled by their primary entry points.
  */
 export function extractPublicCommands(program?: Command, explicitCommands?: string[]): string[] {
   if (explicitCommands) {
@@ -127,7 +164,7 @@ export function extractPublicCommands(program?: Command, explicitCommands?: stri
       .filter((name) => name !== 'help' && !name.startsWith('_'));
     return [...new Set(names)].sort();
   }
-  return [...CANONICAL_PUBLIC_COMMANDS];
+  return [];
 }
 
 /**
@@ -137,7 +174,8 @@ export function extractPublicCommands(program?: Command, explicitCommands?: stri
 export async function collectCapabilities(
   opts: CollectCapabilitiesOptions = {},
 ): Promise<CapabilityReport> {
-  const defaults = defaultDeps();
+  const timeout = opts.timeoutMs ?? opts.deps?.timeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS;
+  const defaults = defaultDeps(timeout);
   const nodeVersion = opts.deps?.nodeVersion ?? defaults.nodeVersion!;
   const cliVersion = opts.deps?.cliVersion ?? defaults.cliVersion!;
   const kicadProbe = opts.deps?.kicadVersion ?? defaults.kicadVersion!;
@@ -170,20 +208,23 @@ export async function collectCapabilities(
  * Execute capability handshake action for the CLI command.
  */
 export async function runCapabilities(
-  opts: CollectCapabilitiesOptions & { json?: boolean } = {},
+  opts: CollectCapabilitiesOptions = {},
 ): Promise<CapabilityReport> {
   return collectCapabilities(opts);
 }
 
 /**
  * Verify if a given protocol string is compatible with the expected protocol major.
+ * Internal validation utility; consumers validate the reported protocol identifier directly.
+ * Strict grammar: rejects leading zeros (e.g. `copperhead-run/01`), non-numeric minor suffixes
+ * (e.g. `copperhead-run/1.anything`), non-matching majors, or foreign protocol prefixes.
  */
 export function isProtocolCompatible(
   protocol: string,
   expectedMajor = SUPPORTED_PROTOCOL_MAJOR,
 ): boolean {
   if (!protocol || typeof protocol !== 'string') return false;
-  const match = protocol.match(/^copperhead-run\/(\d+)(?:\.|$)/);
+  const match = protocol.match(/^copperhead-run\/([1-9]\d*)(?:\.(\d+))?$/);
   if (!match) return false;
   const major = Number(match[1]);
   return Number.isFinite(major) && major === expectedMajor;
@@ -191,14 +232,17 @@ export function isProtocolCompatible(
 
 /**
  * Assert that a capability document or protocol identifier is compatible.
- * Throws an actionable error if the protocol major differs.
+ * Throws an actionable error if the protocol major differs or report is malformed.
  */
 export function assertProtocolCompatible(
-  report: { protocol: string; [key: string]: unknown },
+  report: { protocol: string; [key: string]: unknown } | null | undefined,
   expectedMajor = SUPPORTED_PROTOCOL_MAJOR,
 ): void {
-  if (!report || !isProtocolCompatible(report.protocol, expectedMajor)) {
-    const received = report?.protocol ?? String(report);
+  if (!report || typeof report !== 'object' || typeof report.protocol !== 'string' || !isProtocolCompatible(report.protocol, expectedMajor)) {
+    const received =
+      report && typeof report === 'object' && 'protocol' in report && typeof report.protocol === 'string'
+        ? report.protocol
+        : String(report);
     throw new Error(
       `Unsupported protocol version "${received}". Expected copperhead-run/${expectedMajor}.`,
     );

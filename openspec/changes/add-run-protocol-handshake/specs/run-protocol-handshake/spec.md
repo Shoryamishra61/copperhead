@@ -28,8 +28,15 @@ The capability document SHALL include a `features` array enumerating only capabi
 - **WHEN** the capability document is inspected
 - **THEN** `features` does not contain `"event-stream"`, `"result-document"`, or `"run-id"`
 
+### Requirement: Deterministic top-level command inventory
+The capability discovery record SHALL include a `commands` array containing the lexicographically sorted list of registered top-level primary commands. In Phase 0, command aliases and nested subcommands SHALL NOT be listed in the top-level array.
+
+#### Scenario: Handshake lists registered primary commands
+- **WHEN** `copperhead capabilities --json` runs
+- **THEN** `commands` contains the sorted list of primary command names matching the registered CLI commands
+
 ### Requirement: Tool dependency probing and safe degradation
-The capability document SHALL report installed tool versions under `tools` for `kicadCli`, `git`, `openspec`, and `node`. A missing, malformed, or failing tool probe SHALL report `null` for that tool and SHALL NOT fail the handshake. Probe failures SHALL NOT leak internal filepaths or stack traces.
+The capability document SHALL report installed tool versions under `tools` for `kicadCli`, `git`, `openspec`, and `node`. A missing, malformed, failing, or timed-out tool probe SHALL report `null` for that tool and SHALL NOT fail the handshake. Probe failures SHALL NOT leak internal filepaths or stack traces.
 
 #### Scenario: All tools present
 - **WHEN** all tool binaries are installed and accessible
@@ -38,6 +45,14 @@ The capability document SHALL report installed tool versions under `tools` for `
 #### Scenario: Missing KiCad CLI degrades to null
 - **WHEN** `kicad-cli` is not installed or not found on PATH
 - **THEN** `tools.kicadCli` is `null` and the handshake exits 0 with valid JSON
+
+#### Scenario: Timed-out tool probe degrades to null
+- **WHEN** a tool probe subprocess exceeds its execution deadline (5000 ms)
+- **THEN** the subprocess is terminated, that tool reports `null`, and the handshake exits 0
+
+#### Scenario: Malformed or warning-only tool output degrades to null without path leakage
+- **WHEN** a tool probe emits unparseable diagnostics or host warning paths
+- **THEN** that tool reports `null` and no host paths appear in stdout
 
 #### Scenario: Missing Git degrades to null
 - **WHEN** `git` is not installed or not found on PATH
