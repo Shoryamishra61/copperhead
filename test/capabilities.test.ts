@@ -1,5 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import { mkdtemp, readdir, rm, writeFile, chmod } from 'node:fs/promises';
+import { mkdtemp, readdir, rm, writeFile, chmod, readFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -22,7 +24,7 @@ import {
   type CapabilityDeps,
 } from '../src/commands/capabilities.js';
 import { runDoctor } from '../src/commands/doctor.js';
-import { resetKicadCliCache } from '../src/kicad/cli.js';
+import { resetKicadCliCache, execKicadProcess, killProcessTree } from '../src/kicad/cli.js';
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const DIST_CLI = path.join(ROOT, 'dist', 'cli.js');
@@ -326,22 +328,20 @@ describe('hermetic collectCapabilities with injected dependencies', () => {
 });
 
 describe('subprocess adapter and probe deadline enforcement', () => {
-  it('degrades to null when KiCad probe execution exceeds deadline', async () => {
-    // Configurable short timeout of 200ms with a delayed executable
-    const scratchDir = await mkdtemp(path.join(tmpdir(), 'copperhead-hang-test-'));
+  it('enforces deadline on slow Windows wrapper, terminates descendant process tree, and unblocks handshake within bounded time', async () => {
+    // Configurable short timeout of 300ms with a delayed executable (10s delay)
+    const scratchDir = await mkdtemp(path.join(tmpdir(), 'copperhead-wrapper-hang-'));
+    const pidFile = path.join(scratchDir, 'descendant.pid');
     const isWin = process.platform === 'win32';
     const fakeKicad = path.join(scratchDir, isWin ? 'fake-kicad.cmd' : 'fake-kicad.sh');
 
     if (isWin) {
-      await writeFile(
-        fakeKicad,
-        '@node -e "setTimeout(() => console.log(\'10.0.4\'), 3000)"\n',
-        'utf8',
-      );
+      const nodeCode = `const fs = require('fs'); fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setTimeout(() => console.log('10.0.4'), 10000);`;
+      await writeFile(fakeKicad, `@node -e "${nodeCode}"\n`, 'utf8');
     } else {
       await writeFile(
         fakeKicad,
-        '#!/bin/sh\nsleep 3\necho "10.0.4"\n',
+        `#!/bin/sh\nsleep 10\necho "10.0.4"\n`,
         'utf8',
       );
       await chmod(fakeKicad, 0o755);
@@ -351,9 +351,10 @@ describe('subprocess adapter and probe deadline enforcement', () => {
     try {
       process.env.COPPERHEAD_KICAD_CLI = fakeKicad;
       resetKicadCliCache();
-      // collectCapabilities with short timeout of 200ms
+      const startTime = Date.now();
+
       const report = await collectCapabilities({
-        timeoutMs: 200,
+        timeoutMs: 300,
         commands: ['check'],
         deps: {
           nodeVersion: 'v20.19.0',
@@ -363,7 +364,79 @@ describe('subprocess adapter and probe deadline enforcement', () => {
         },
       });
 
+      const elapsed = Date.now() - startTime;
+
       // Must degrade to null on timeout rather than hanging
+      expect(report.tools.kicadCli).toBeNull();
+      expect(report.tools.git).toBe('2.43.0');
+
+      // Handshake must complete within a reasonable bounded tolerance (well below the 10s child delay)
+      expect(elapsed).toBeLessThan(4500);
+
+      // On Windows, verify that the descendant child process was terminated and not orphaned
+      if (isWin && existsSync(pidFile)) {
+        const descendantPid = (await readFile(pidFile, 'utf8')).trim();
+        if (descendantPid) {
+          let tasklistOutput = '';
+          try {
+            tasklistOutput = execFileSync('tasklist', ['/FI', `PID eq ${descendantPid}`], {
+              encoding: 'utf8',
+              windowsHide: true,
+            });
+          } catch {}
+          expect(tasklistOutput).not.toContain(descendantPid);
+        }
+      }
+    } finally {
+      if (savedEnv !== undefined) {
+        process.env.COPPERHEAD_KICAD_CLI = savedEnv;
+      } else {
+        delete process.env.COPPERHEAD_KICAD_CLI;
+      }
+      resetKicadCliCache();
+      await rm(scratchDir, { recursive: true, force: true });
+    }
+  });
+
+  it('enforces deadline on slow native executable within bounded time', async () => {
+    const startTime = Date.now();
+    const res = await execKicadProcess(
+      process.execPath,
+      ['-e', 'setTimeout(() => {}, 10000);'],
+      300,
+    );
+    const elapsed = Date.now() - startTime;
+
+    expect(res.failed).toBe(true);
+    // Bounded execution: completes well before 10000ms delay
+    expect(elapsed).toBeLessThan(3500);
+  });
+
+  it('handles responsive native executable cleanly and quickly', async () => {
+    const res = await execKicadProcess(process.execPath, ['-v'], 3000);
+    expect(res.failed).toBe(false);
+    expect(String(res.stdout).trim()).toMatch(/^v\d+/);
+  });
+
+  it('handles missing KiCad cleanly without failing capability collection', async () => {
+    const scratchDir = await mkdtemp(path.join(tmpdir(), 'copperhead-missing-test-'));
+    const nonExistent = path.join(scratchDir, 'nonexistent-kicad-cli.exe');
+    const savedEnv = process.env.COPPERHEAD_KICAD_CLI;
+
+    try {
+      process.env.COPPERHEAD_KICAD_CLI = nonExistent;
+      resetKicadCliCache();
+
+      const report = await collectCapabilities({
+        commands: ['check'],
+        deps: {
+          nodeVersion: 'v20.19.0',
+          cliVersion: '0.11.0',
+          gitVersion: async () => '2.43.0',
+          openspecVersion: async () => '1.14.1',
+        },
+      });
+
       expect(report.tools.kicadCli).toBeNull();
       expect(report.tools.git).toBe('2.43.0');
     } finally {

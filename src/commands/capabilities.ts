@@ -3,7 +3,7 @@ import { promisify } from 'node:util';
 import { createRequire } from 'node:module';
 import { execa } from 'execa';
 import type { Command } from 'commander';
-import { kicadCliVersion } from '../kicad/cli.js';
+import { kicadCliVersion, execKicadProcess } from '../kicad/cli.js';
 
 const execFileP = promisify(execFile);
 
@@ -135,8 +135,8 @@ export function defaultDeps(timeoutMs = DEFAULT_PROBE_TIMEOUT_MS): CapabilityDep
       return parseGitVersion(stdout);
     },
     openspecVersion: async () => {
-      const { stdout } = await execa('openspec', ['--version'], { timeout: timeoutMs });
-      return parseOpenspecVersion(stdout);
+      const res = await execKicadProcess('openspec', ['--version'], timeoutMs);
+      return parseOpenspecVersion(String(res.stdout ?? ''));
     },
   };
 }
