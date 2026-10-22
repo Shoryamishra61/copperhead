@@ -13,8 +13,8 @@ Issue #258 outlines the need for a versioned run protocol stream. Phase 0 establ
     ```json
     {
       "protocol": "copperhead-run/1",
-      "cli": "0.11.0",
-      "commands": ["capabilities", "check", "create", "demo", "do", "doctor", "draft", "export", "init", "mcp", "repl", "score", "skill", "sync"],
+      "cli": "0.12.0",
+      "commands": ["capabilities", "check", "create", "demo", "do", "doctor", "draft", "export", "init", "mcp", "repl", "review", "score", "skill", "sync"],
       "features": [],
       "tools": {
         "kicadCli": "9.0.1",
