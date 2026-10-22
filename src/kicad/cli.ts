@@ -211,55 +211,84 @@ function fallbackAfterMissing(): string {
 }
 
 /**
- * Safely terminate a spawned process tree on Windows.
- * Strictly scoped to the specified process ID and its descendants.
+ * Safely terminate a spawned process tree.
+ * On Windows, taskkill is scoped to the specified process ID and its descendants.
+ * On POSIX, the caller must have spawned the child as a process-group leader so
+ * the negative PID reaches every descendant.
  */
-export function killProcessTree(pid: number | undefined): void {
-  if (process.platform !== 'win32' || !pid) return;
+export function killProcessTree(pid: number | undefined, processGroup = false): void {
+  if (!pid) return;
+  if (process.platform === 'win32') {
+    try {
+      const systemRoot = process.env.SystemRoot ?? process.env.windir;
+      const taskkillBin = systemRoot
+        ? path.join(systemRoot, 'System32', 'taskkill.exe')
+        : 'taskkill';
+      execFileSync(taskkillBin, ['/F', '/T', '/PID', String(pid)], {
+        stdio: 'ignore',
+        windowsHide: true,
+        timeout: 2000,
+      });
+    } catch {
+      // Process may have already exited or taskkill returned non-zero
+    }
+    return;
+  }
+
+  if (processGroup) {
+    try {
+      process.kill(-pid, 'SIGKILL');
+      return;
+    } catch {
+      // The child may not be a group leader, or every group member has exited
+    }
+  }
   try {
-    const taskkillBin = process.env.SystemRoot
-      ? path.join(process.env.SystemRoot, 'System32', 'taskkill.exe')
-      : 'taskkill';
-    execFileSync(taskkillBin, ['/F', '/T', '/PID', String(pid)], {
-      stdio: 'ignore',
-      windowsHide: true,
-    });
+    process.kill(pid, 'SIGKILL');
   } catch {
-    // Process may have already exited or taskkill returned non-zero
+    // Process may have already exited
   }
 }
 
+export type BoundedProcessResult = Awaited<ReturnType<typeof execa>> & {
+  /** True when the deadline expired before the subprocess completed. */
+  timedOut?: boolean;
+};
+
 /**
- * Execute a KiCad subprocess with deadline enforcement.
- * When a timeout is specified, process-tree termination is enforced on Windows
- * to prevent batch-wrapper descendants from holding inherited stdio descriptors open.
+ * Execute an external CLI subprocess with deadline enforcement.
+ * Timed-out processes are force-killed as a tree so wrappers cannot leave
+ * descendants holding inherited stdio descriptors open.
  */
-export async function execKicadProcess(
+export async function execBoundedProcess(
   bin: string,
   args: string[],
   timeoutMs?: number,
-): Promise<Awaited<ReturnType<typeof execa>>> {
+): Promise<BoundedProcessResult> {
   if (!timeoutMs || timeoutMs <= 0) {
     return execa(bin, args, { reject: false });
   }
 
   const controller = new AbortController();
+  const useProcessGroup = process.platform !== 'win32';
   const subprocess = execa(bin, args, {
     reject: false,
     cancelSignal: controller.signal,
+    killSignal: 'SIGKILL',
+    detached: useProcessGroup,
   });
 
   let didTimeout = false;
   const timer = setTimeout(() => {
     didTimeout = true;
-    killProcessTree(subprocess.pid);
+    killProcessTree(subprocess.pid, useProcessGroup);
     controller.abort();
   }, timeoutMs);
 
   try {
     const res = await subprocess;
     if (didTimeout) {
-      (res as { timedOut?: boolean }).timedOut = true;
+      res.timedOut = true;
     }
     return res;
   } finally {
@@ -267,13 +296,13 @@ export async function execKicadProcess(
   }
 }
 
-async function runKicad(args: string[], opts?: { reject?: boolean; timeout?: number }): Promise<Awaited<ReturnType<typeof execa>>> {
+async function runKicad(args: string[], opts?: { reject?: boolean; timeout?: number }): Promise<BoundedProcessResult> {
   let bin = resolveKicadCli();
-  let res = await execKicadProcess(bin, args, opts?.timeout);
+  let res = await execBoundedProcess(bin, args, opts?.timeout);
   if (res.failed && isNotFoundError(res)) {
     if (bin === 'kicad-cli') {
       bin = fallbackAfterMissing();
-      res = await execKicadProcess(bin, args, opts?.timeout);
+      res = await execBoundedProcess(bin, args, opts?.timeout);
     } else {
       throw new KicadCliMissingError();
     }
@@ -318,6 +347,9 @@ export interface KicadCliVersionOptions {
 
 export async function kicadCliVersion(opts?: KicadCliVersionOptions): Promise<string> {
   const res = await runKicad(['version'], opts);
+  if (res.timedOut) {
+    throw new Error('kicad-cli version probe exceeded its deadline');
+  }
   return String(res.stdout ?? '').trim();
 }
 

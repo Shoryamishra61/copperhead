@@ -1,11 +1,10 @@
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import { createRequire } from 'node:module';
-import { execa } from 'execa';
 import type { Command } from 'commander';
-import { kicadCliVersion, execKicadProcess } from '../kicad/cli.js';
-
-const execFileP = promisify(execFile);
+import {
+  kicadCliVersion,
+  execBoundedProcess,
+  type BoundedProcessResult,
+} from '../kicad/cli.js';
 
 /**
  * Protocol identifier for the Copperhead CLI-to-consumer boundary (Issue #258).
@@ -80,7 +79,9 @@ export function parseKicadVersion(raw: string | null | undefined): string | null
   if (!raw || typeof raw !== 'string') return null;
   const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
   for (const line of lines) {
-    const match = line.match(/^(?:kicad-cli\s+)?v?(\d+\.\d+(?:\.\d+)?(?:[-+][a-zA-Z0-9._-]+)?)$/i);
+    const match = line.match(
+      /^(?:kicad-cli\s+)?v?((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:\.(?:0|[1-9]\d*))?(?:-[0-9A-Za-z](?:[0-9A-Za-z._-]*[0-9A-Za-z])?)?(?:\+[0-9A-Za-z](?:[0-9A-Za-z._-]*[0-9A-Za-z])?)?)$/i,
+    );
     if (match) {
       return match[1]!;
     }
@@ -97,7 +98,9 @@ export function parseGitVersion(raw: string | null | undefined): string | null {
   if (!raw || typeof raw !== 'string') return null;
   const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
   for (const line of lines) {
-    const match = line.match(/^git version\s+([0-9]+\.[0-9]+(?:\.[0-9a-zA-Z._-]+)*)/i);
+    const match = line.match(
+      /^git version\s+((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:\.(?:0|[1-9]\d*))?(?:[.-][0-9A-Za-z]+)*)(?:\s+\([^)]*\))?$/i,
+    );
     if (match) {
       return match[1]!;
     }
@@ -113,12 +116,22 @@ export function parseOpenspecVersion(raw: string | null | undefined): string | n
   if (!raw || typeof raw !== 'string') return null;
   const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
   for (const line of lines) {
-    const match = line.match(/^(?:openspec\s+)?v?(\d+\.\d+(?:\.\d+)?(?:[-+][a-zA-Z0-9._-]+)?)$/i);
+    const match = line.match(
+      /^(?:openspec\s+)?v?((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:\.(?:0|[1-9]\d*))?(?:-[0-9A-Za-z](?:[0-9A-Za-z._-]*[0-9A-Za-z])?)?(?:\+[0-9A-Za-z](?:[0-9A-Za-z._-]*[0-9A-Za-z])?)?)$/i,
+    );
     if (match) {
       return match[1]!;
     }
   }
   return null;
+}
+
+function parseSuccessfulProbe(
+  res: BoundedProcessResult,
+  parse: (raw: string) => string | null,
+): string | null {
+  if (res.failed || res.timedOut) return null;
+  return parse(String(res.stdout ?? ''));
 }
 
 export function defaultDeps(timeoutMs = DEFAULT_PROBE_TIMEOUT_MS): CapabilityDeps {
@@ -131,12 +144,12 @@ export function defaultDeps(timeoutMs = DEFAULT_PROBE_TIMEOUT_MS): CapabilityDep
       return parseKicadVersion(raw);
     },
     gitVersion: async () => {
-      const { stdout } = await execFileP('git', ['--version'], { timeout: timeoutMs });
-      return parseGitVersion(stdout);
+      const res = await execBoundedProcess('git', ['--version'], timeoutMs);
+      return parseSuccessfulProbe(res, parseGitVersion);
     },
     openspecVersion: async () => {
-      const res = await execKicadProcess('openspec', ['--version'], timeoutMs);
-      return parseOpenspecVersion(String(res.stdout ?? ''));
+      const res = await execBoundedProcess('openspec', ['--version'], timeoutMs);
+      return parseSuccessfulProbe(res, parseOpenspecVersion);
     },
   };
 }
@@ -156,7 +169,7 @@ export interface CollectCapabilitiesOptions {
  */
 export function extractPublicCommands(program?: Command, explicitCommands?: string[]): string[] {
   if (explicitCommands) {
-    return [...explicitCommands].sort();
+    return [...new Set(explicitCommands)].sort();
   }
   if (program && Array.isArray(program.commands) && program.commands.length > 0) {
     const names = program.commands
@@ -202,15 +215,6 @@ export async function collectCapabilities(
       node: nodeVersion,
     },
   };
-}
-
-/**
- * Execute capability handshake action for the CLI command.
- */
-export async function runCapabilities(
-  opts: CollectCapabilitiesOptions = {},
-): Promise<CapabilityReport> {
-  return collectCapabilities(opts);
 }
 
 /**

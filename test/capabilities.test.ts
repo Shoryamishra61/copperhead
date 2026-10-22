@@ -13,6 +13,7 @@ import {
   IMPLEMENTED_PROTOCOL_FEATURES,
   DEFAULT_PROBE_TIMEOUT_MS,
   collectCapabilities,
+  defaultDeps,
   isProtocolCompatible,
   assertProtocolCompatible,
   formatCapabilities,
@@ -24,7 +25,7 @@ import {
   type CapabilityDeps,
 } from '../src/commands/capabilities.js';
 import { runDoctor } from '../src/commands/doctor.js';
-import { resetKicadCliCache, execKicadProcess, killProcessTree } from '../src/kicad/cli.js';
+import { resetKicadCliCache, execBoundedProcess } from '../src/kicad/cli.js';
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const DIST_CLI = path.join(ROOT, 'dist', 'cli.js');
@@ -38,12 +39,40 @@ const TSX_CLI = path.join(ROOT, 'node_modules', 'tsx', 'dist', 'cli.mjs');
 function mockUnitDeps(over: Partial<CapabilityDeps> = {}): CapabilityDeps {
   return {
     nodeVersion: 'v20.19.0',
-    cliVersion: '0.11.0',
+    cliVersion: '0.12.0',
     kicadVersion: async () => '10.0.4',
     gitVersion: async () => '2.43.0',
     openspecVersion: async () => '1.14.1',
     ...over,
   };
+}
+
+const IS_WINDOWS = process.platform === 'win32';
+
+/**
+ * Write a fake external executable for PATH-based probe tests.
+ * `body` is a cmd batch body on Windows and a sh body elsewhere.
+ */
+async function writeFakeExecutable(dir: string, name: string, body: string): Promise<string> {
+  const file = path.join(dir, IS_WINDOWS ? `${name}.cmd` : name);
+  await writeFile(file, IS_WINDOWS ? body : `#!/bin/sh\n${body}\n`, 'utf8');
+  if (!IS_WINDOWS) await chmod(file, 0o755);
+  return file;
+}
+
+async function withPrependedPath<T>(dir: string, fn: () => Promise<T>): Promise<T> {
+  const saved = process.env.PATH;
+  process.env.PATH = `${dir}${path.delimiter}${saved ?? ''}`;
+  try {
+    return await fn();
+  } finally {
+    if (saved === undefined) delete process.env.PATH;
+    else process.env.PATH = saved;
+  }
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 describe('protocol constant and version semantics', () => {
@@ -86,7 +115,7 @@ describe('protocol constant and version semantics', () => {
   it('assertProtocolCompatible accepts valid report and rejects unknown major or invalid input', () => {
     const validReport: CapabilityReport = {
       protocol: 'copperhead-run/1',
-      cli: '0.11.0',
+      cli: '0.12.0',
       commands: ['check', 'do'],
       features: [],
       tools: {
@@ -125,7 +154,7 @@ describe('protocol constant and version semantics', () => {
   it('consumer compatibility ignores unknown added JSON fields (extensibility)', () => {
     const extendedReport = {
       protocol: 'copperhead-run/1',
-      cli: '0.11.0',
+      cli: '0.12.0',
       commands: ['check', 'do'],
       features: [],
       tools: {
@@ -150,6 +179,16 @@ describe('tool output version parsers', () => {
       expect(parseKicadVersion('kicad-cli v8.0.4')).toBe('8.0.4');
       expect(parseKicadVersion('10.0.5-rc1')).toBe('10.0.5-rc1');
       expect(parseKicadVersion('8.0.4+extra')).toBe('8.0.4+extra');
+      expect(parseKicadVersion('10.0.5-rc1+extra')).toBe('10.0.5-rc1+extra');
+    });
+
+    it('rejects leading zeros, trailing punctuation, extra components, and ANSI decoration', () => {
+      expect(parseKicadVersion('01.2.3')).toBeNull();
+      expect(parseKicadVersion('1.02.3')).toBeNull();
+      expect(parseKicadVersion('10.0.4.')).toBeNull();
+      expect(parseKicadVersion('10.0.4.1')).toBeNull();
+      expect(parseKicadVersion('10.0.4 (build)')).toBeNull();
+      expect(parseKicadVersion('\u001b[32m10.0.4\u001b[0m')).toBeNull();
     });
 
     it('extracts version when preceded by diagnostic or warning lines', () => {
@@ -183,6 +222,14 @@ describe('tool output version parsers', () => {
       expect(parseGitVersion('git version 2.52.0.windows.1')).toBe('2.52.0.windows.1');
       expect(parseGitVersion('git version 2.39.3 (Apple Git-146)')).toBe('2.39.3');
       expect(parseGitVersion('git version 2.40.0.vfs.0.4')).toBe('2.40.0.vfs.0.4');
+      expect(parseGitVersion('git version 2.43.0-rc1')).toBe('2.43.0-rc1');
+    });
+
+    it('rejects leading zeros and trailing garbage instead of returning a partial version', () => {
+      expect(parseGitVersion('git version 02.43.0')).toBeNull();
+      expect(parseGitVersion('git version 2.43.0.')).toBeNull();
+      expect(parseGitVersion('git version 2.43.0 C:\\Users\\victim\\secret')).toBeNull();
+      expect(parseGitVersion('git version 2.43.0 (Apple Git-146) trailing')).toBeNull();
     });
 
     it('returns null on empty, warning-only, or host-path output', () => {
@@ -204,6 +251,13 @@ describe('tool output version parsers', () => {
       expect(parseOpenspecVersion('openspec v1.10.0-beta.2')).toBe('1.10.0-beta.2');
     });
 
+    it('rejects leading zeros, trailing punctuation, and decorated output', () => {
+      expect(parseOpenspecVersion('01.2.3')).toBeNull();
+      expect(parseOpenspecVersion('1.14.1.')).toBeNull();
+      expect(parseOpenspecVersion('1.14.1 (build)')).toBeNull();
+      expect(parseOpenspecVersion('\u001b[32m1.14.1\u001b[0m')).toBeNull();
+    });
+
     it('returns null on empty, warning-only, or host-path output', () => {
       expect(parseOpenspecVersion('')).toBeNull();
       expect(parseOpenspecVersion('   ')).toBeNull();
@@ -219,7 +273,7 @@ describe('hermetic collectCapabilities with injected dependencies', () => {
   it('returns well-formed schema when all tools report versions', async () => {
     const deps = mockUnitDeps({
       nodeVersion: 'v20.19.0',
-      cliVersion: '0.11.0',
+      cliVersion: '0.12.0',
       kicadVersion: async () => '10.0.4',
       gitVersion: async () => '2.43.0',
       openspecVersion: async () => '1.14.1',
@@ -229,7 +283,7 @@ describe('hermetic collectCapabilities with injected dependencies', () => {
 
     expect(report).toEqual({
       protocol: 'copperhead-run/1',
-      cli: '0.11.0',
+      cli: '0.12.0',
       commands: ['check', 'do'],
       features: [],
       tools: {
@@ -322,26 +376,43 @@ describe('hermetic collectCapabilities with injected dependencies', () => {
     expect(commands).not.toContain('help');
   });
 
+  it('excludes aliases and nested subcommands from the top-level inventory', () => {
+    const prog = new Command();
+    prog.command('check').alias('verify');
+    const skill = prog.command('skill');
+    skill.command('list');
+    prog.command('export').command('bom');
+
+    expect(extractPublicCommands(prog)).toEqual(['check', 'export', 'skill']);
+  });
+
+  it('deduplicates and sorts explicit commands', () => {
+    expect(extractPublicCommands(undefined, ['sync', 'check', 'sync', 'do'])).toEqual([
+      'check',
+      'do',
+      'sync',
+    ]);
+  });
+
   it('returns empty array when neither program nor explicit commands are given', () => {
     expect(extractPublicCommands()).toEqual([]);
   });
 });
 
 describe('subprocess adapter and probe deadline enforcement', () => {
-  it('enforces deadline on slow Windows wrapper, terminates descendant process tree, and unblocks handshake within bounded time', async () => {
-    // Configurable short timeout of 300ms with a delayed executable (10s delay)
+  it('prints a version then hangs, degrades to null, and terminates the process tree within the deadline', async () => {
     const scratchDir = await mkdtemp(path.join(tmpdir(), 'copperhead-wrapper-hang-'));
     const pidFile = path.join(scratchDir, 'descendant.pid');
-    const isWin = process.platform === 'win32';
+    const isWin = IS_WINDOWS;
     const fakeKicad = path.join(scratchDir, isWin ? 'fake-kicad.cmd' : 'fake-kicad.sh');
 
     if (isWin) {
-      const nodeCode = `const fs = require('fs'); fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setTimeout(() => console.log('10.0.4'), 10000);`;
+      const nodeCode = `const fs = require('fs'); fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); console.log('10.0.4'); setTimeout(() => {}, 10000);`;
       await writeFile(fakeKicad, `@node -e "${nodeCode}"\n`, 'utf8');
     } else {
       await writeFile(
         fakeKicad,
-        `#!/bin/sh\nsleep 10\necho "10.0.4"\n`,
+        `#!/bin/sh\necho "10.0.4"\nsleep 10 &\necho $! > "${pidFile}"\nwait\n`,
         'utf8',
       );
       await chmod(fakeKicad, 0o755);
@@ -353,38 +424,58 @@ describe('subprocess adapter and probe deadline enforcement', () => {
       resetKicadCliCache();
       const startTime = Date.now();
 
-      const report = await collectCapabilities({
-        timeoutMs: 300,
+      const reportPromise = collectCapabilities({
+        timeoutMs: 1500,
         commands: ['check'],
         deps: {
           nodeVersion: 'v20.19.0',
-          cliVersion: '0.11.0',
+          cliVersion: '0.12.0',
           gitVersion: async () => '2.43.0',
           openspecVersion: async () => '1.14.1',
         },
       });
 
+      // Give the wrapper time to start its descendant, but never beyond the probe deadline.
+      const pidDeadline = Date.now() + 1200;
+      while (!existsSync(pidFile) && Date.now() < pidDeadline) {
+        await delay(50);
+      }
+
+      const report = await reportPromise;
       const elapsed = Date.now() - startTime;
 
-      // Must degrade to null on timeout rather than hanging
+      // The version was printed before the hang, but a timed-out probe must still be null.
       expect(report.tools.kicadCli).toBeNull();
       expect(report.tools.git).toBe('2.43.0');
 
-      // Handshake must complete within a reasonable bounded tolerance (well below the 10s child delay)
-      expect(elapsed).toBeLessThan(4500);
+      // Handshake must complete well below the 10s child delay.
+      expect(elapsed).toBeLessThan(6000);
 
-      // On Windows, verify that the descendant child process was terminated and not orphaned
-      if (isWin && existsSync(pidFile)) {
-        const descendantPid = (await readFile(pidFile, 'utf8')).trim();
-        if (descendantPid) {
-          let tasklistOutput = '';
-          try {
-            tasklistOutput = execFileSync('tasklist', ['/FI', `PID eq ${descendantPid}`], {
-              encoding: 'utf8',
-              windowsHide: true,
-            });
-          } catch {}
-          expect(tasklistOutput).not.toContain(descendantPid);
+      // Verify that the descendant process was terminated and not orphaned.
+      if (existsSync(pidFile)) {
+        const descendantPid = Number((await readFile(pidFile, 'utf8')).trim());
+        if (Number.isInteger(descendantPid) && descendantPid > 0) {
+          if (isWin) {
+            let tasklistOutput = '';
+            try {
+              tasklistOutput = execFileSync('tasklist', ['/FI', `PID eq ${descendantPid}`], {
+                encoding: 'utf8',
+                windowsHide: true,
+              });
+            } catch {}
+            expect(tasklistOutput).not.toContain(String(descendantPid));
+          } else {
+            let alive = true;
+            for (let attempt = 0; attempt < 20 && alive; attempt++) {
+              try {
+                process.kill(descendantPid, 0);
+                await delay(50);
+              } catch {
+                alive = false;
+              }
+            }
+            expect(alive).toBe(false);
+          }
         }
       }
     } finally {
@@ -400,7 +491,7 @@ describe('subprocess adapter and probe deadline enforcement', () => {
 
   it('enforces deadline on slow native executable within bounded time', async () => {
     const startTime = Date.now();
-    const res = await execKicadProcess(
+    const res = await execBoundedProcess(
       process.execPath,
       ['-e', 'setTimeout(() => {}, 10000);'],
       300,
@@ -408,12 +499,27 @@ describe('subprocess adapter and probe deadline enforcement', () => {
     const elapsed = Date.now() - startTime;
 
     expect(res.failed).toBe(true);
+    expect(res.timedOut).toBe(true);
     // Bounded execution: completes well before 10000ms delay
     expect(elapsed).toBeLessThan(3500);
   });
 
+  it('force-kills a probe that ignores SIGTERM instead of waiting for the graceful shutdown delay', async () => {
+    const startTime = Date.now();
+    const res = await execBoundedProcess(
+      process.execPath,
+      ['-e', "process.on('SIGTERM', () => {}); setTimeout(() => {}, 10000);"],
+      300,
+    );
+    const elapsed = Date.now() - startTime;
+
+    expect(res.failed).toBe(true);
+    expect(res.timedOut).toBe(true);
+    expect(elapsed).toBeLessThan(3500);
+  });
+
   it('handles responsive native executable cleanly and quickly', async () => {
-    const res = await execKicadProcess(process.execPath, ['-v'], 3000);
+    const res = await execBoundedProcess(process.execPath, ['-v'], 3000);
     expect(res.failed).toBe(false);
     expect(String(res.stdout).trim()).toMatch(/^v\d+/);
   });
@@ -431,7 +537,7 @@ describe('subprocess adapter and probe deadline enforcement', () => {
         commands: ['check'],
         deps: {
           nodeVersion: 'v20.19.0',
-          cliVersion: '0.11.0',
+          cliVersion: '0.12.0',
           gitVersion: async () => '2.43.0',
           openspecVersion: async () => '1.14.1',
         },
@@ -480,7 +586,7 @@ describe('subprocess adapter and probe deadline enforcement', () => {
         commands: ['check'],
         deps: {
           nodeVersion: 'v20.19.0',
-          cliVersion: '0.11.0',
+          cliVersion: '0.12.0',
           gitVersion: async () => '2.43.0',
           openspecVersion: async () => '1.14.1',
         },
@@ -522,7 +628,7 @@ describe('subprocess adapter and probe deadline enforcement', () => {
         commands: ['check'],
         deps: {
           nodeVersion: 'v20.19.0',
-          cliVersion: '0.11.0',
+          cliVersion: '0.12.0',
           gitVersion: async () => '2.43.0',
           openspecVersion: async () => '1.14.1',
         },
@@ -539,13 +645,115 @@ describe('subprocess adapter and probe deadline enforcement', () => {
       await rm(scratchDir, { recursive: true, force: true });
     }
   });
+
+  it('rejects a valid-looking version from a failing kicad-cli process', async () => {
+    const scratchDir = await mkdtemp(path.join(tmpdir(), 'copperhead-kicad-fail-'));
+    const fakeKicad = await writeFakeExecutable(
+      scratchDir,
+      'kicad-fail',
+      IS_WINDOWS ? '@echo 10.0.4 & exit /b 1' : 'echo "10.0.4"; exit 1',
+    );
+    const savedEnv = process.env.COPPERHEAD_KICAD_CLI;
+    try {
+      process.env.COPPERHEAD_KICAD_CLI = fakeKicad;
+      resetKicadCliCache();
+      const report = await collectCapabilities({
+        timeoutMs: 2000,
+        commands: ['check'],
+        deps: {
+          nodeVersion: 'v20.19.0',
+          cliVersion: '0.12.0',
+          gitVersion: async () => '2.43.0',
+          openspecVersion: async () => '1.14.1',
+        },
+      });
+
+      expect(report.tools.kicadCli).toBeNull();
+    } finally {
+      if (savedEnv !== undefined) {
+        process.env.COPPERHEAD_KICAD_CLI = savedEnv;
+      } else {
+        delete process.env.COPPERHEAD_KICAD_CLI;
+      }
+      resetKicadCliCache();
+      await rm(scratchDir, { recursive: true, force: true });
+    }
+  });
+
+  it('degrades a failing git probe to null even when it prints a version', async () => {
+    const scratchDir = await mkdtemp(path.join(tmpdir(), 'copperhead-git-fail-'));
+    try {
+      await writeFakeExecutable(
+        scratchDir,
+        'git',
+        IS_WINDOWS ? '@echo git version 2.43.0 & exit /b 1' : 'echo "git version 2.43.0"; exit 1',
+      );
+      const deps = defaultDeps(1000);
+      const value = await withPrependedPath(scratchDir, async () => deps.gitVersion!());
+      expect(value).toBeNull();
+    } finally {
+      await rm(scratchDir, { recursive: true, force: true });
+    }
+  });
+
+  it('degrades a failing or timed-out openspec probe to null instead of parsing printed versions', async () => {
+    const scratchDir = await mkdtemp(path.join(tmpdir(), 'copperhead-openspec-fail-'));
+    try {
+      await writeFakeExecutable(
+        scratchDir,
+        'openspec',
+        IS_WINDOWS ? '@echo 9.9.9 & exit /b 1' : 'echo "9.9.9"; exit 1',
+      );
+      const failing = defaultDeps(1000);
+      expect(await withPrependedPath(scratchDir, async () => failing.openspecVersion!())).toBeNull();
+
+      await writeFakeExecutable(
+        scratchDir,
+        'openspec',
+        IS_WINDOWS
+          ? '@node -e "console.log(\'9.9.9\'); setTimeout(() => {}, 10000)"'
+          : 'echo "9.9.9"; sleep 10',
+      );
+      const started = Date.now();
+      const timedOut = defaultDeps(300);
+      expect(await withPrependedPath(scratchDir, async () => timedOut.openspecVersion!())).toBeNull();
+      expect(Date.now() - started).toBeLessThan(4000);
+    } finally {
+      await rm(scratchDir, { recursive: true, force: true });
+    }
+  });
+
+  it('parses valid output from the default git and openspec probes', async () => {
+    const scratchDir = await mkdtemp(path.join(tmpdir(), 'copperhead-probe-ok-'));
+    try {
+      await writeFakeExecutable(
+        scratchDir,
+        'git',
+        IS_WINDOWS ? '@echo git version 2.43.0' : 'echo "git version 2.43.0"',
+      );
+      await writeFakeExecutable(
+        scratchDir,
+        'openspec',
+        IS_WINDOWS ? '@echo 1.14.1' : 'echo "1.14.1"',
+      );
+      const deps = defaultDeps(2000);
+      const [git, openspec] = await withPrependedPath(scratchDir, async () => [
+        await deps.gitVersion!(),
+        await deps.openspecVersion!(),
+      ]);
+      expect(git).toBe('2.43.0');
+      expect(openspec).toBe('1.14.1');
+    } finally {
+      await rm(scratchDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('formatCapabilities human output', () => {
   it('formats a clean summary for human consumption', () => {
     const report: CapabilityReport = {
       protocol: 'copperhead-run/1',
-      cli: '0.11.0',
+      cli: '0.12.0',
       commands: ['check', 'do', 'create'],
       features: [],
       tools: {
@@ -558,7 +766,7 @@ describe('formatCapabilities human output', () => {
 
     const formatted = formatCapabilities(report);
     expect(formatted).toContain('copperhead-run/1');
-    expect(formatted).toContain('0.11.0');
+    expect(formatted).toContain('0.12.0');
     expect(formatted).toContain('check, do, create');
     expect(formatted).toContain('10.0.4');
     expect(formatted).toContain('2.43.0');
@@ -568,7 +776,7 @@ describe('formatCapabilities human output', () => {
   it('formats missing tools cleanly as not found / none', () => {
     const report: CapabilityReport = {
       protocol: 'copperhead-run/1',
-      cli: '0.11.0',
+      cli: '0.12.0',
       commands: ['check'],
       features: [],
       tools: {
@@ -617,13 +825,17 @@ describe('real CLI process execution (published build and source entry point)', 
       expect(res.exitCode).toBe(0);
       expect(res.stderr).toBe('');
 
+      const pkg = JSON.parse(await readFile(path.join(ROOT, 'package.json'), 'utf8')) as {
+        version: string;
+      };
       const parsed = JSON.parse(res.stdout) as CapabilityReport;
       expect(parsed.protocol).toBe('copperhead-run/1');
-      expect(parsed.cli).toMatch(/^\d+\.\d+\.\d+/);
+      expect(parsed.cli).toBe(pkg.version);
       expect(parsed.commands).toContain('capabilities');
       expect(parsed.commands).toContain('check');
       expect(parsed.commands).toContain('do');
       expect(parsed.commands).toContain('doctor');
+      expect(parsed.commands).toContain('review');
       expect(parsed.features).toEqual([]);
       expect(parsed.tools.node).toMatch(/^v\d+/);
 

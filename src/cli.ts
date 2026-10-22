@@ -8,7 +8,7 @@ import { pickModel } from './util/select.js';
 import { runInit, InitError } from './memory/scaffold.js';
 import { runCheck } from './commands/check.js';
 import { runDoctor, formatDoctor } from './commands/doctor.js';
-import { runCapabilities, formatCapabilities } from './commands/capabilities.js';
+import { collectCapabilities, formatCapabilities } from './commands/capabilities.js';
 import { syncVerify, syncResolve, formatSyncReport } from './commands/sync.js';
 import { runCreate } from './commands/create.js';
 import { runDemo, demoTourText } from './commands/demo.js';
@@ -284,7 +284,7 @@ program
     // Like doctor, capabilities never gates on kicad-cli or a repository being
     // present: it reports supported protocol, commands, features, and tools.
     try {
-      const report = await runCapabilities({ program });
+      const report = await collectCapabilities({ program });
       if (program.opts().json) {
         console.log(JSON.stringify(report, null, 2));
       } else {
