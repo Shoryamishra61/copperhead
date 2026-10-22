@@ -33,7 +33,7 @@ import { openspecInit } from '../openspec/cli.js';
 import { sweepStaleTempDirs, pruneHistoryDir } from '../util/tmp.js';
 import { bomSymbolDossier } from '../kicad/dossier.js';
 import { symbolSearchDirs } from '../kicad/symlib.js';
-import { isDraftQualityHeading } from '../kicad/fab.js';
+import { draftQualitySection, isDraftQualityHeading, isFilledDraftQuality } from '../kicad/fab.js';
 import { assertDiskSpace, DEFAULT_MIN_FREE_BYTES } from '../util/preflight.js';
 import { runCheck } from './check.js';
 import { emitCreateJlcpcbBom } from './export.js';
@@ -61,18 +61,29 @@ async function docHasContent(repoRoot: string, rel: string, marker: string): Pro
   return (await readFile(p, 'utf8')).includes(marker);
 }
 
+/**
+ * The layout document's Draft quality section, under a numbered heading or not
+ * (#327): 'missing' with no such heading, 'empty' when only comments sit under
+ * it (the placeholder `copperhead init` scaffolds), 'duplicate' when that empty
+ * heading is followed by another, else 'filled'. It reads the first section,
+ * as `check --fab` does, so the stage never finishes on a section the fab
+ * check then calls empty.
+ */
+async function draftQualityState(repoRoot: string, rel: string): Promise<'missing' | 'empty' | 'duplicate' | 'filled'> {
+  const p = path.join(repoRoot, rel);
+  if (!existsSync(p)) return 'missing';
+  const text = await readFile(p, 'utf8');
+  const section = draftQualitySection(text);
+  if (section === null) return 'missing';
+  if (isFilledDraftQuality(section)) return 'filled';
+  return text.split(/\r?\n/).filter(isDraftQualityHeading).length > 1 ? 'duplicate' : 'empty';
+}
+
 // Heading-aware variant of docHasContent: matches any Markdown heading whose
 // text contains `word`, ignoring heading level, leading numbering ("3."), and
 // trailing decoration ("Budgets and constraints (...)"). Stage prompts don't
 // dictate exact heading text, so a literal `.includes('## Budgets')` produces
 // false negatives against valid docs titled e.g. "## 3. Budgets and constraints".
-/** The layout document has its Draft quality heading, numbered or not (#327). */
-async function docHasDraftQuality(repoRoot: string, rel: string): Promise<boolean> {
-  const p = path.join(repoRoot, rel);
-  if (!existsSync(p)) return false;
-  return (await readFile(p, 'utf8')).split(/\r?\n/).some(isDraftQualityHeading);
-}
-
 async function docHasHeading(repoRoot: string, rel: string, word: string): Promise<boolean> {
   const p = path.join(repoRoot, rel);
   if (!existsSync(p)) return false;
@@ -124,6 +135,49 @@ async function dirHasFiles(dirPath: string, exts?: string[]): Promise<boolean> {
     return false;
   }
   return walk(dirPath);
+}
+
+const FIRMWARE_SOURCE_EXTS = ['.c', '.h', '.cpp', '.hpp', '.py', '.rs', '.ino', '.s'];
+
+/**
+ * Stock KiCad libraries with nothing programmable in them (#377). Only these
+ * can waive firmware: a part from any other library, a project library
+ * included (`fixture:ESP32-S3-MINI`), may hold code, so an unknown part never
+ * excuses the stage.
+ */
+const NON_PROGRAMMABLE_LIB =
+  /^(Device|Connector(_\w+)?|Diode(_\w+)?|Transistor_\w+|Regulator_\w+|Mechanical|power|Power_Protection|LED|Switch|Jumper|Graphic|Amplifier_Operational|Amplifier_Instrumentation|Comparator|Reference_Voltage|Relay|Timer)$/;
+
+/**
+ * The schematic's parts that could hold firmware, by the library their symbol
+ * comes from; null when there is no schematic to read, which waives nothing.
+ */
+async function programmableParts(root: string): Promise<string[] | null> {
+  try {
+    const config = await loadConfig(root);
+    if (!config.schematic) return null;
+    const p = path.join(root, config.schematic);
+    if (!existsSync(p)) return null;
+    const symbols = await listSymbols(p);
+    if (!symbols.length) return null;
+    return symbols.filter((s) => !NON_PROGRAMMABLE_LIB.test(s.libId.split(':')[0] ?? '')).map((s) => `${s.ref} (${s.libId})`);
+  } catch {
+    return null;
+  }
+}
+
+/** firmware/README.md opens with "# No firmware" and says why below it. */
+async function noFirmwareReadme(root: string): Promise<boolean> {
+  const p = path.join(root, 'firmware', 'README.md');
+  if (!existsSync(p)) return false;
+  // an HTML comment, one line or many, closed or not, is not a written reason
+  const lines = (await readFile(p, 'utf8'))
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/<!--[\s\S]*$/, '')
+    .split(/\r?\n/);
+  const first = lines.findIndex((l) => l.trim());
+  if (first < 0 || !/^#\s+No firmware\b/i.test(lines[first]!.trim())) return false;
+  return lines.slice(first + 1).some((l) => l.trim() && !l.trim().startsWith('#'));
 }
 
 export const STAGES: Stage[] = [
@@ -270,21 +324,7 @@ export const STAGES: Stage[] = [
   },
   {
     name: 'layout-draft',
-    isComplete: async (root, docs) => {
-      // The LAYOUT.md marker alone is not enough: `copperhead init` scaffolds
-      // LAYOUT.md with the literal "## Draft quality" heading. And "a board
-      // with a footprint" was not enough either (#314): the board must carry
-      // exactly the schematic's parts, each with its schematic footprint, so
-      // an outline-only board or a partial one never passes (AC-15.38).
-      const config = await loadConfig(root);
-      if (!config.board || !config.schematic) return false;
-      if (!(await boardMatchesSchematic(root, config)).ok) return false;
-      if (await layoutDocGap(root, docs)) return false;
-      // DRC-clean is part of "done", as ERC is for the schematic stage: a run
-      // killed after Draft quality was written but before a clean run_drc must
-      // not resume as complete and get its board committed unverified
-      return boardDrcOk(root, config.board);
-    },
+    isComplete: async (root, docs) => (await layoutDraftGap(root, docs)) === null,
     prompt: (_brief, docs) => {
       // posix: this path is shown to the model, and must read the same on Windows
       const layoutDoc = path.posix.join(docs, 'LAYOUT.md');
@@ -312,10 +352,17 @@ export const STAGES: Stage[] = [
     name: 'firmware',
     isComplete: async (root) => {
       // An empty firmware/ dir must not count. Require at least one source file.
-      return dirHasFiles(path.join(root, 'firmware'), ['.c', '.h', '.cpp', '.hpp', '.py', '.rs', '.ino', '.s']);
+      if (await dirHasFiles(path.join(root, 'firmware'), FIRMWARE_SOURCE_EXTS)) return true;
+      // A board with nothing programmable on it (#377) completes on a written
+      // "# No firmware" README, but only when the schematic, not the model,
+      // shows there is no part to program.
+      if (!(await noFirmwareReadme(root))) return false;
+      const parts = await programmableParts(root);
+      return parts !== null && parts.length === 0;
     },
     prompt: () =>
-      'Stage 7: firmware scaffold. Generate firmware/ for the chosen MCU HAL: pins.h generated from PINOUT.md (single source of truth), driver stubs, and one working happy path. If the vendor toolchain is available, the build must pass; if not, note "not compiled here" explicitly in DEVPLAN.md.',
+      'Stage 7: firmware scaffold. Generate firmware/ for the chosen MCU HAL: pins.h generated from PINOUT.md (single source of truth), driver stubs, and one working happy path. If the vendor toolchain is available, the build must pass; if not, note "not compiled here" explicitly in DEVPLAN.md. ' +
+      'Only if the board has nothing programmable on it (every schematic symbol comes from a stock non-programmable KiCad library: Device, Connector*, Diode*, Transistor_*, Regulator_*, Mechanical, power, Power_Protection, LED, Switch, Jumper, Graphic, Amplifier_Operational, Amplifier_Instrumentation, Comparator, Reference_Voltage, Relay, Timer) do not invent code: write firmware/README.md beginning with the heading "# No firmware" and, below it, why, citing the documents that record it (SPEC.md, SUBSYSTEMS.md). The stage gate reads the schematic: a part from any other library, a project library included, still needs source.',
   },
   {
     name: 'devplan',
@@ -497,15 +544,46 @@ async function populateStop(opts: CreateOptions): Promise<string | null> {
  */
 export async function layoutDocGap(root: string, docs: string): Promise<string | null> {
   const layoutDoc = path.posix.join(docs, 'LAYOUT.md');
-  if (await docHasDraftQuality(root, layoutDoc)) return null;
-  const stray = layoutDoc !== 'LAYOUT.md' && (await docHasDraftQuality(root, 'LAYOUT.md'));
-  return (
-    `${layoutDoc} has no "## Draft quality" section` +
-    (stray ? `; the section was written to LAYOUT.md at the repository root, which this stage does not read: put it in ${layoutDoc}` : '')
-  );
+  const state = await draftQualityState(root, layoutDoc);
+  if (state === 'filled') return null;
+  const stray = layoutDoc !== 'LAYOUT.md' && (await draftQualityState(root, 'LAYOUT.md')) === 'filled';
+  const where = stray ? `; the section was written to LAYOUT.md at the repository root, which this stage does not read: put it in ${layoutDoc}` : '';
+  if (state === 'duplicate') {
+    return `${layoutDoc} has more than one "## Draft quality" heading and the first is empty: keep one heading, with the assessment under it${where}`;
+  }
+  if (state === 'empty') {
+    return `the "## Draft quality" section in ${layoutDoc} is empty: write what is fine, how many connections are still unrouted, and what a human should redo${where}`;
+  }
+  return `${layoutDoc} has no "## Draft quality" section${where}`;
 }
 
-async function contractGapDetail(stageName: string, root: string, config: CopperheadConfig): Promise<string> {
+/**
+ * What keeps layout-draft from being complete, or null when it is. The
+ * document alone is not enough: `copperhead init` scaffolds its heading, and
+ * populate puts the schematic's parts on the board before the first turn, so
+ * a gate that read either alone would pass a stage nobody placed (#314). The
+ * board must carry exactly the schematic's parts, each with its schematic
+ * footprint (AC-15.38), and pass DRC, as ERC is part of "done" for the
+ * schematic stage: a run killed after Draft quality was written but before a
+ * clean run_drc must not resume as complete and get its board committed
+ * unverified. Cheapest first, since finish asks on every attempt: a file
+ * read, then a netlist export, then a full DRC. `drcFailed` is for a caller
+ * that already knows the stage is incomplete: when the rest holds, DRC is
+ * what failed, and running it again would only cost time.
+ */
+async function layoutDraftGap(root: string, docs: string, opts: { drcFailed?: boolean } = {}): Promise<string | null> {
+  const docGap = await layoutDocGap(root, docs);
+  if (docGap) return docGap;
+  const config = await loadConfig(root);
+  const m = await boardMatchesSchematic(root, config);
+  if (!m.ok) return `${m.detail}; restore the populated footprints (never add or rewrite them) and move them instead`;
+  if (opts.drcFailed || !(await boardDrcOk(root, config.board!))) {
+    return 'the board does not pass DRC; run run_drc and fix what it reports before finishing';
+  }
+  return null;
+}
+
+export async function contractGapDetail(stageName: string, root: string, config: CopperheadConfig): Promise<string> {
   const generic = 'the run finished but the stage completion contract is not met — no usable artifact was produced';
   if (stageName === 'part-selection') {
     const r = await bomFootprintMisses(root, config.docs);
@@ -518,16 +596,21 @@ async function contractGapDetail(stageName: string, root: string, config: Copper
       );
     }
   }
-  if (stageName === 'layout-draft') {
-    const fresh = await loadConfig(root);
-    const m = await boardMatchesSchematic(root, fresh);
-    if (!m.ok) {
-      return `the layout-draft contract is not met: ${m.detail}; restore the populated footprints (never add or rewrite them) and move them instead`;
+  if (stageName === 'firmware' && (await noFirmwareReadme(root))) {
+    const parts = await programmableParts(root);
+    if (parts === null) return 'the firmware contract is not met: firmware/README.md says "No firmware", but no schematic with parts could be read to confirm it, so the stage needs source files under firmware/';
+    if (parts.length) {
+      return (
+        `the firmware contract is not met: firmware/README.md says "No firmware", but these schematic parts are not from a stock non-programmable library: ${parts.join(', ')}; ` +
+        'if one of them is programmable, write firmware source for it under firmware/; if none of them holds firmware, they are outside the waiver list, so stop for a human rather than inventing code'
+      );
     }
-    const docGap = await layoutDocGap(root, fresh.docs);
-    return docGap
-      ? `the layout-draft contract is not met: ${docGap}`
-      : 'the layout-draft contract is not met: the board does not pass DRC; run run_drc and fix what it reports before finishing';
+  }
+  if (stageName === 'layout-draft') {
+    // the same gap, in the same order, that finish was told; isComplete just ran
+    // the DRC, so it is not run again
+    const gap = await layoutDraftGap(root, (await loadConfig(root)).docs, { drcFailed: true });
+    return gap ? `the layout-draft contract is not met: ${gap}` : generic;
   }
   if (stageName !== 'schematic' || !config.schematic) return generic;
   const p = path.join(root, config.schematic);
@@ -1141,8 +1224,10 @@ export async function runCreate(opts: CreateOptions): Promise<{ ok: boolean; com
           // message yet, and a generic one would only spend turns.
           ...(stage.name === 'layout-draft'
             ? {
-                stageGate: async () =>
-                  (await stage.isComplete(opts.repoRoot, config.docs)) ? null : contractGapDetail(stage.name, opts.repoRoot, config),
+                stageGate: async () => {
+                  const gap = await layoutDraftGap(opts.repoRoot, config.docs);
+                  return gap && `the layout-draft contract is not met: ${gap}`;
+                },
               }
             : {}),
           ...(stageTurns !== undefined ? { maxTurns: stageTurns } : {}),
