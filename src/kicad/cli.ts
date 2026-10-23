@@ -346,9 +346,12 @@ export interface KicadCliVersionOptions {
 }
 
 export async function kicadCliVersion(opts?: KicadCliVersionOptions): Promise<string> {
-  const res = await runKicad(['version'], opts);
+  const res = await runKicad(['version'], { ...opts, reject: false });
   if (res.timedOut) {
     throw new Error('kicad-cli version probe exceeded its deadline');
+  }
+  if (res.failed) {
+    throw Object.assign(new Error(String(res.stderr || res.stdout || `kicad-cli exited ${res.exitCode}`)), res);
   }
   return String(res.stdout ?? '').trim();
 }

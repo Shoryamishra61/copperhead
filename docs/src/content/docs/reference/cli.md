@@ -9,7 +9,7 @@ sidebar:
 copperhead [global options] [<command>]
 ```
 
-With no subcommand, `copperhead` starts the interactive agent shell. With the exception of `--help` and `capabilities`, every command probes `kicad-cli` before doing anything and exits 1 if it cannot be found. Resolution order: `COPPERHEAD_KICAD_CLI` when set, then `kicad-cli` on your `PATH`, then the macOS KiCad.app bundle locations. Setting `COPPERHEAD_KICAD_CLI` to a path that does not exist is an error naming that path, not a silent fall back to `PATH`. A `.env` in the working directory is loaded before any command resolves a model or a provider; a real environment variable always beats the file.
+With no subcommand, `copperhead` starts the interactive agent shell. Commands that execute ERC/DRC or run the agent loop (`repl`, `init`, `check`/`verify`, `do`, `sync`, `demo`, and `create`) probe `kicad-cli` before doing anything and exit 1 if it cannot be found. Resolution order: `COPPERHEAD_KICAD_CLI` when set, then `kicad-cli` on your `PATH`, then the macOS KiCad.app bundle locations. Setting `COPPERHEAD_KICAD_CLI` to a path that does not exist is an error naming that path, not a silent fall back to `PATH`. A `.env` in the working directory is loaded before any command resolves a model or a provider; a real environment variable always beats the file.
 
 ## Commands at a glance
 
@@ -184,7 +184,7 @@ With `--json`, prints `{ ok, checks: [{ name, status, detail, hint? }] }`.
 copperhead capabilities [--json]
 ```
 
-Offline, deterministic capability handshake for non-interactive consumers (CI runners, hosted supervisors, MCP hosts). It reports the wire protocol, CLI version, the public command inventory, implemented features, and installed tool versions. Unlike every other command, it does not require `kicad-cli`, a git repository, or a provider credential. A probe failure or timeout degrades that tool's version to `null` instead of failing the handshake.
+Offline, deterministic capability handshake for non-interactive consumers (CI runners, hosted supervisors, MCP hosts). It reports the wire protocol, CLI version, the public command inventory, implemented features, and installed tool versions. Like doctor, it does not require `kicad-cli`, a git repository, or a provider credential. A probe failure or timeout degrades that tool's version to `null` instead of failing the handshake.
 
 ```json
 {

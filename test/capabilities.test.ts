@@ -25,7 +25,12 @@ import {
   type CapabilityDeps,
 } from '../src/commands/capabilities.js';
 import { runDoctor } from '../src/commands/doctor.js';
-import { resetKicadCliCache, execBoundedProcess } from '../src/kicad/cli.js';
+import {
+  resetKicadCliCache,
+  execBoundedProcess,
+  killProcessTree,
+  kicadCliVersion,
+} from '../src/kicad/cli.js';
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const DIST_CLI = path.join(ROOT, 'dist', 'cli.js');
@@ -524,6 +529,56 @@ describe('subprocess adapter and probe deadline enforcement', () => {
     expect(String(res.stdout).trim()).toMatch(/^v\d+/);
   });
 
+  it('safely handles undefined or 0 pid in killProcessTree as a no-op', () => {
+    expect(() => killProcessTree(undefined)).not.toThrow();
+    expect(() => killProcessTree(0)).not.toThrow();
+  });
+
+  it('falls back to bare taskkill command when SystemRoot and windir are unset on Windows', () => {
+    if (!IS_WINDOWS) return;
+    const savedRoot = process.env.SystemRoot;
+    const savedWindir = process.env.windir;
+    try {
+      delete process.env.SystemRoot;
+      delete process.env.windir;
+      expect(() => killProcessTree(999999)).not.toThrow();
+    } finally {
+      if (savedRoot !== undefined) process.env.SystemRoot = savedRoot;
+      if (savedWindir !== undefined) process.env.windir = savedWindir;
+    }
+  });
+
+  it('throws explicit deadline exceeded error when kicadCliVersion times out', async () => {
+    const scratchDir = await mkdtemp(path.join(tmpdir(), 'copperhead-kicad-timeout-'));
+    const isWin = IS_WINDOWS;
+    const fakeKicad = path.join(scratchDir, isWin ? 'fake-hang-kicad.cmd' : 'fake-hang-kicad.sh');
+
+    if (isWin) {
+      await writeFile(fakeKicad, '@node -e "setTimeout(() => {}, 10000);"\n', 'utf8');
+    } else {
+      await writeFile(fakeKicad, '#!/bin/sh\nsleep 10\n', 'utf8');
+      await chmod(fakeKicad, 0o755);
+    }
+
+    const savedEnv = process.env.COPPERHEAD_KICAD_CLI;
+    try {
+      process.env.COPPERHEAD_KICAD_CLI = fakeKicad;
+      resetKicadCliCache();
+
+      await expect(kicadCliVersion({ timeout: 200 })).rejects.toThrow(
+        'kicad-cli version probe exceeded its deadline',
+      );
+    } finally {
+      if (savedEnv !== undefined) {
+        process.env.COPPERHEAD_KICAD_CLI = savedEnv;
+      } else {
+        delete process.env.COPPERHEAD_KICAD_CLI;
+      }
+      resetKicadCliCache();
+      await rm(scratchDir, { recursive: true, force: true });
+    }
+  });
+
   it('handles missing KiCad cleanly without failing capability collection', async () => {
     const scratchDir = await mkdtemp(path.join(tmpdir(), 'copperhead-missing-test-'));
     const nonExistent = path.join(scratchDir, 'nonexistent-kicad-cli.exe');
@@ -950,31 +1005,67 @@ describe('real CLI process execution (published build and source entry point)', 
   });
 
   it('guarantees build versus source CLI semantic parity using direct tsx execution', async () => {
-    const distRes = await execa(process.execPath, [DIST_CLI, 'capabilities', '--json'], {
-      cwd: ROOT,
-      reject: false,
-      env: { NO_COLOR: '1', PATH: process.env.PATH },
-    });
+    const scratchDir = await mkdtemp(path.join(tmpdir(), 'copperhead-parity-'));
+    try {
+      await writeFakeExecutable(
+        scratchDir,
+        'git',
+        IS_WINDOWS ? '@echo git version 2.44.0' : 'echo "git version 2.44.0"',
+      );
+      await writeFakeExecutable(
+        scratchDir,
+        'openspec',
+        IS_WINDOWS ? '@echo 1.10.0' : 'echo "1.10.0"',
+      );
+      const fakeKicad = await writeFakeExecutable(
+        scratchDir,
+        'fake-kicad-cli',
+        IS_WINDOWS ? '@echo 10.0.4' : 'echo "10.0.4"',
+      );
 
-    const srcRes = await execa(process.execPath, [TSX_CLI, SRC_CLI, 'capabilities', '--json'], {
-      cwd: ROOT,
-      reject: false,
-      env: { NO_COLOR: '1', PATH: process.env.PATH },
-    });
+      const controlledEnv = {
+        ...process.env,
+        NO_COLOR: '1',
+        PATH: `${scratchDir}${path.delimiter}${process.env.PATH ?? ''}`,
+        COPPERHEAD_KICAD_CLI: fakeKicad,
+      };
 
-    expect(distRes.exitCode).toBe(0);
-    expect(srcRes.exitCode).toBe(0);
+      const distRes = await execa(process.execPath, [DIST_CLI, 'capabilities', '--json'], {
+        cwd: ROOT,
+        reject: false,
+        env: controlledEnv,
+      });
 
-    const distJson = JSON.parse(distRes.stdout) as CapabilityReport;
-    const srcJson = JSON.parse(srcRes.stdout) as CapabilityReport;
+      const srcRes = await execa(process.execPath, [TSX_CLI, SRC_CLI, 'capabilities', '--json'], {
+        cwd: ROOT,
+        reject: false,
+        env: controlledEnv,
+      });
 
-    expect(distJson.protocol).toBe(srcJson.protocol);
-    expect(distJson.cli).toBe(srcJson.cli);
-    expect(distJson.commands).toEqual(srcJson.commands);
-    expect(distJson.features).toEqual(srcJson.features);
-    expect(distJson.tools.node).toBe(srcJson.tools.node);
-    expect(distJson.tools.kicadCli).toBe(srcJson.tools.kicadCli);
-    expect(distJson.tools.git).toBe(srcJson.tools.git);
-    expect(distJson.tools.openspec).toBe(srcJson.tools.openspec);
+      expect(distRes.exitCode).toBe(0);
+      expect(srcRes.exitCode).toBe(0);
+
+      const distJson = JSON.parse(distRes.stdout) as CapabilityReport;
+      const srcJson = JSON.parse(srcRes.stdout) as CapabilityReport;
+
+      // Independent expected-value oracles
+      expect(distJson.protocol).toBe(COPPERHEAD_RUN_PROTOCOL);
+      expect(distJson.features).toEqual([]);
+      expect(distJson.tools).toEqual({
+        node: process.version,
+        kicadCli: '10.0.4',
+        git: '2.44.0',
+        openspec: '1.10.0',
+      });
+
+      // Strict semantic parity between dist/cli.js and tsx src/cli.ts
+      expect(distJson.protocol).toBe(srcJson.protocol);
+      expect(distJson.cli).toBe(srcJson.cli);
+      expect(distJson.commands).toEqual(srcJson.commands);
+      expect(distJson.features).toEqual(srcJson.features);
+      expect(distJson.tools).toEqual(srcJson.tools);
+    } finally {
+      await rm(scratchDir, { recursive: true, force: true });
+    }
   });
 });
