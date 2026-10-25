@@ -1438,7 +1438,7 @@ function draftFitted(validated: ValidatedIntent, projectName: string, today: str
   return { model: out.model, report: out.report };
 }
 
-function draftOnce(
+export function draftOnce(
   validated: ValidatedIntent,
   projectName: string,
   today: string,
@@ -4743,8 +4743,11 @@ function draftOnce(
     });
   }
 
-  // signal nets: local nets wired, everything else labelled at a stub
   const bodies = [...placed.values()].map((p) => p.body);
+  const placedList = [...placed.values()].map((pl) => ({
+    body: pl.body,
+    pins: pl.sym.pins.map((pin) => pinAt(pl, pin)),
+  }));
   // Every signal pin's stub, drawn or not yet: a route is judged against the
   // stubs of nets drafted after it as well as the wires of those before. A
   // stub is taken two units longer than drawn, the room its label needs: a
@@ -4786,7 +4789,14 @@ function draftOnce(
     pl.sym.pins.map((pin) => {
       const p = pinAt(pl, pin);
       const o = outward(pin);
-      const end = o.dx > 0 ? { x: pl.body.maxX, y: p.y } : o.dx < 0 ? { x: pl.body.minX, y: p.y } : o.dy > 0 ? { x: p.x, y: pl.body.maxY } : { x: p.x, y: pl.body.minY };
+      const end =
+        o.dx > 0
+          ? { x: Math.min(p.x, pl.body.maxX), y: p.y }
+          : o.dx < 0
+            ? { x: Math.max(p.x, pl.body.minX), y: p.y }
+            : o.dy > 0
+              ? { x: p.x, y: Math.min(p.y, pl.body.maxY) }
+              : { x: p.x, y: Math.max(p.y, pl.body.minY) };
       return { p, end };
     }),
   ).filter((l) => Math.abs(l.p.x - l.end.x) + Math.abs(l.p.y - l.end.y) > 0.01);
@@ -4825,8 +4835,15 @@ function draftOnce(
       const xs = subset.map((s) => s.end.x).sort((a, b) => a - b);
       const ys = subset.map((s) => s.end.y);
       const admit = (candidate: RouteSeg[]): boolean => {
-        if (candidate.some((c) => bodies.some((b) => segCrossesBody(c.x1, c.y1, c.x2, c.y2, b)))) return false;
-        if (candidate.some(touchesLead)) return false;
+        for (const c of candidate) {
+          for (const pl of placedList) {
+            const endsOnPin = pl.pins.some(
+              (p) => (sameCoord(p.x, c.x1) && sameCoord(p.y, c.y1)) || (sameCoord(p.x, c.x2) && sameCoord(p.y, c.y2)),
+            );
+            if (!endsOnPin && segCrossesBody(c.x1, c.y1, c.x2, c.y2, pl.body)) return false;
+          }
+          if (touchesLead(c)) return false;
+        }
         return !touchesForeign(candidate, net.name, new Set(net.pins));
       };
       const found: Route[] = [];
@@ -4875,6 +4892,37 @@ function draftOnce(
           candidate.push({ x1: meetXs[i - 1]!, y1: trunkY, x2: meetXs[i]!, y2: trunkY });
         }
         if (admit(candidate)) found.push({ segs: candidate, trunkX: meetXs[0]!, trunkY });
+      }
+      // A direct straight wire for two collinear facing pins:
+      // When two endpoints lie on the same coordinate axis and their outward
+      // directions face directly toward one another, the natural human
+      // schematic connection is a single straight wire segment between them.
+      // Because their fixed stub vectors (STUB * U) may overshoot past the
+      // opposite pin into its body when the distance is under 2 * STUB * U,
+      // trunk/comb routing rejects the overshooting stubs. A direct segment
+      // connects the facing pins cleanly with zero bends, zero junctions, and
+      // zero crossings.
+      if (subset.length === 2) {
+        const [a, b] = subset as [Stub, Stub];
+        const vertFacing =
+          sameCoord(a.ep.at.x, b.ep.at.x) &&
+          a.o.dx === 0 &&
+          b.o.dx === 0 &&
+          ((a.ep.at.y < b.ep.at.y && a.o.dy > 0 && b.o.dy < 0) ||
+            (a.ep.at.y > b.ep.at.y && a.o.dy < 0 && b.o.dy > 0));
+        const horizFacing =
+          sameCoord(a.ep.at.y, b.ep.at.y) &&
+          a.o.dy === 0 &&
+          b.o.dy === 0 &&
+          ((a.ep.at.x < b.ep.at.x && a.o.dx > 0 && b.o.dx < 0) ||
+            (a.ep.at.x > b.ep.at.x && a.o.dx < 0 && b.o.dx > 0));
+        const dist = vertFacing ? Math.abs(a.ep.at.y - b.ep.at.y) : Math.abs(a.ep.at.x - b.ep.at.x);
+        if ((vertFacing || horizFacing) && dist <= STUB * U + 1e-6) {
+          const directCandidate: RouteSeg[] = [{ x1: a.ep.at.x, y1: a.ep.at.y, x2: b.ep.at.x, y2: b.ep.at.y }];
+          if (admit(directCandidate)) {
+            found.push({ segs: directCandidate, trunkX: a.ep.at.x, trunkY: a.ep.at.y });
+          }
+        }
       }
       // A hook, for two stubs where one lies on a row and the other is a
       // lead below or above it on an axis the row would have to cross: run
@@ -5004,7 +5052,16 @@ function draftOnce(
       // candidate clears every body wins; the run's top-left point is the
       // last resort.
       const vertTops = r.segs.filter((c) => sameCoord(c.x1, c.x2)).map((c) => ({ x: c.x1, y: Math.min(c.y1, c.y2) }));
-      const candidates = [...vertTops.sort((a, b) => a.y - b.y || a.x - b.x), pts[0]!];
+      const horizSegs = r.segs.filter((c) => sameCoord(c.y1, c.y2));
+      const horizPts: { x: number; y: number }[] = [];
+      for (const seg of horizSegs) {
+        const minX = Math.min(seg.x1, seg.x2);
+        const maxX = Math.max(seg.x1, seg.x2);
+        for (let x = minX; x <= maxX + 1e-6; x += U) {
+          horizPts.push({ x: onGridLine(x), y: seg.y1 });
+        }
+      }
+      const candidates = [...vertTops.sort((a, b) => a.y - b.y || a.x - b.x), ...horizPts.sort((a, b) => a.x - b.x), pts[0]!];
       // a part is its body and its leads: the leads run from the body out to
       // the pins' connection points, and a name anchored at a lead's end
       // stood on it (VREF_RAW over R3's lower lead)
@@ -5022,8 +5079,14 @@ function draftOnce(
         if ([...placed.values()].some((pl) => boundsOverlap(b, withLeads(pl)))) return false;
         return !labels.some((o) => o.name !== net.name && boundsOverlap(padBox(b), labelTextBox(o.name, o.x, o.y, o.rot)));
       };
-      const at = candidates.find(clearOfBodies) ?? pts[0]!;
-      labels.push({ name: net.name, x: at.x, y: at.y, rot: 0, kind: 'local' });
+      const at = candidates.find(clearOfBodies);
+      if (!at && net.name.startsWith('Net-(') && subset.length === eps.length) {
+        trace(`wired net ${net.name}: no clear label anchor on short run; keeping wire unlabelled`);
+        wired++;
+        return;
+      }
+      const chosenAt = at ?? pts[0]!;
+      labels.push({ name: net.name, x: chosenAt.x, y: chosenAt.y, rot: 0, kind: 'local' });
       netWired.push(labels.length - 1);
       wiredLabels.push({ label: labels.length - 1, pts, segs: r.segs.map((c) => ({ ...c })) });
       wired++;
