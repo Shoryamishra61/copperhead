@@ -60,6 +60,10 @@ function pointOnSeg(px: number, py: number, x1: number, y1: number, x2: number, 
   return false;
 }
 
+function sameCoord(a: number, b: number, eps = 0.01): boolean {
+  return Math.abs(a - b) < eps;
+}
+
 /**
  * Deterministic custom symbols for direct routing fixtures:
  * Body is 2.54 mm x 2.54 mm ([-1.27, 1.27] x [-1.27, 1.27]).
@@ -260,6 +264,28 @@ function makeDirectFixtureLib(): string {
 			(pin passive line (at 0 -5.08 90) (length 3.81)
 				(name "~" (effects (font (size 1.27 1.27))))
 				(number "1" (effects (font (size 1.27 1.27))))
+			)
+		)
+	)
+	(symbol "InwardPassThrough"
+		(pin_numbers hide)
+		(pin_names (offset 0))
+		(property "Reference" "U" (at 0 0 0) (effects (font (size 1.27 1.27))))
+		(property "Value" "InwardPassThrough" (at 0 0 0) (effects (font (size 1.27 1.27))))
+		(symbol "InwardPassThrough_0_1"
+			(rectangle (start -2.54 -2.54) (end 2.54 2.54)
+				(stroke (width 0.254) (type default))
+				(fill (type none))
+			)
+		)
+		(symbol "InwardPassThrough_1_1"
+			(pin passive line (at 0 -2.54 90) (length 0.01)
+				(name "1" (effects (font (size 1.27 1.27))))
+				(number "1" (effects (font (size 1.27 1.27))))
+			)
+			(pin passive line (at 0 2.54 270) (length 0.01)
+				(name "2" (effects (font (size 1.27 1.27))))
+				(number "2" (effects (font (size 1.27 1.27))))
 			)
 		)
 	)
@@ -705,36 +731,61 @@ describe('schematic readability & wiring quality (#219)', () => {
     it('refuses inward wire routes that would penetrate a symbol body interior', async () => {
       // Inward wire check:
       // A segment terminating at a pin must approach from the pin's outward direction (into free space).
-      // Segments directed inward into the symbol body are rejected (outwardDot < -0.01).
-      // Here, R1, R2, and R3 are connected in a series net; all emitted wire segments strictly clear
-      // their respective component bodies without penetrating any body interior.
+      // A candidate segment heading inward into the symbol body is rejected by outwardDot < -0.01.
+      // InwardPassThrough has body [-2.54, 2.54] x [-2.54, 2.54], with Pin 1 at (0, -2.54) facing UP
+      // and Pin 2 at (0, 2.54) facing DOWN. A direct connection between Pin 1 and Pin 2 penetrates the
+      // actual transformed body interior. Because the candidate touches Pin 1, touchesOwnedPin is set,
+      // which bypasses segCrossesBody; outwardDot < -0.01 is the sole guard refusing this penetration.
       const intent: SchematicIntent = {
         version: 1,
         parts: [
-          { ref: 'R1', libId: 'Device:R', value: '10k', group: 'MAIN' },
-          { ref: 'R2', libId: 'Device:R', value: '10k', group: 'MAIN' },
-          { ref: 'R3', libId: 'Device:R', value: '10k', group: 'MAIN' },
+          { ref: 'U_INWARD', libId: 'DirectFixture:InwardPassThrough', value: 'PASS', group: 'MAIN' },
         ],
         nets: [
-          { name: 'SERIES_NET', pins: ['R1.2', 'R2.1', 'R3.1'] },
+          { name: 'SHORT_NET', pins: ['U_INWARD.1', 'U_INWARD.2'] },
         ],
       };
 
-      const { model, report, workDir } = await placeWithFixture(intent);
+      const { model, report, workDir } = await placeWithFixture(intent, makeDirectFixtureLib());
       try {
         expect(report.mergedNets).toEqual([]);
 
-        for (const s of model.symbols) {
-          const bodyBox: Bounds = {
-            minX: s.at.x - 1.27,
-            maxX: s.at.x + 1.27,
-            minY: s.at.y - 1.27,
-            maxY: s.at.y + 1.27,
-          };
-          for (const w of model.wires) {
-            expect(segCrossesBoxInterior(w.x1, w.y1, w.x2, w.y2, bodyBox)).toBe(false);
-          }
+        const u = model.symbols.find((s) => s.ref === 'U_INWARD')!;
+        expect(u).toBeDefined();
+
+        // Exact transformed body bounds of U_INWARD matching its symbol definition [-2.54, 2.54]
+        const actualBody: Bounds = {
+          minX: u.at.x - 2.54,
+          maxX: u.at.x + 2.54,
+          minY: u.at.y - 2.54,
+          maxY: u.at.y + 2.54,
+        };
+
+        // All emitted wires for SHORT_NET strictly clear U_INWARD's body interior
+        for (const w of model.wires) {
+          expect(
+            segCrossesBoxInterior(w.x1, w.y1, w.x2, w.y2, actualBody),
+            `Wire (${w.x1}, ${w.y1}) -> (${w.x2}, ${w.y2}) must not penetrate body`,
+          ).toBe(false);
         }
+
+        // Geometric proof: the direct segment between Pin 1 (at -2.54) and Pin 2 (at +2.54)
+        // genuinely penetrates the body interior and has negative outward dot product
+        const pin1 = { x: u.at.x, y: u.at.y - 2.54, out: { dx: 0, dy: -1 } };
+        const pin2 = { x: u.at.x, y: u.at.y + 2.54, out: { dx: 0, dy: 1 } };
+        expect(segCrossesBoxInterior(pin1.x, pin1.y, pin2.x, pin2.y, actualBody)).toBe(true);
+
+        // Vector leaving pin1 toward pin2 is (0, 5.08); outward is (0, -1)
+        const vx1 = pin2.x - pin1.x;
+        const vy1 = pin2.y - pin1.y;
+        const outwardDot1 = vx1 * pin1.out.dx + vy1 * pin1.out.dy;
+        expect(outwardDot1).toBeLessThan(-0.01);
+
+        // Vector leaving pin2 toward pin1 is (0, -5.08); outward is (0, 1)
+        const vx2 = pin1.x - pin2.x;
+        const vy2 = pin1.y - pin2.y;
+        const outwardDot2 = vx2 * pin2.out.dx + vy2 * pin2.out.dy;
+        expect(outwardDot2).toBeLessThan(-0.01);
       } finally {
         await rm(workDir, { recursive: true, force: true });
       }
@@ -941,29 +992,48 @@ describe('schematic readability & wiring quality (#219)', () => {
     });
 
     it('prevents placing a horizontal wired label anchor on a foreign net wire crossing', async () => {
-      // Net A and Net B wires cross perpendicularly:
-      // A horizontal candidate on Net A coincides with Net B's wire at (x_cross, y_cross).
-      // clearOfBodies checks segContains against foreign wires and pending stubs, preventing
-      // the label anchor from landing on the foreign wire and joining the nets.
-      const intent: SchematicIntent = {
-        version: 1,
-        parts: [
-          { ref: 'R1', libId: 'Device:R', value: '10k', group: 'MAIN' },
-          { ref: 'R2', libId: 'Device:R', value: '10k', group: 'MAIN' },
-          { ref: 'R3', libId: 'Device:R', value: '10k', group: 'MAIN' },
-          { ref: 'R4', libId: 'Device:R', value: '10k', group: 'MAIN' },
-        ],
-        nets: [
-          { name: 'NET_A', pins: ['R1.2', 'R3.1'] },
-          { name: 'NET_B', pins: ['R2.2', 'R4.1'] },
-        ],
-      };
-
-      const { model, report, workDir } = await placeWithFixture(intent);
+      // In the buck-12v-5v reference board, BOOT has a horizontal wired run at y = 49.53 crossing
+      // foreign net SW's vertical wire at x = 129.54 perpendicularly.
+      // horizPts includes (129.54, 49.53) as a candidate position for the BOOT label.
+      // clearOfBodies uses segContains(w, pt.x, pt.y) to detect foreign wires and stubs,
+      // preventing the label anchor from landing on the foreign wire and merging the nets.
+      const buckDir = path.resolve('manual-tests/reference-boards/buck-12v-5v');
+      const intent: SchematicIntent = JSON.parse(await readFile(path.join(buckDir, 'schematic.intent.json'), 'utf8'));
+      const workDir = await mkdtemp(path.join(tmpdir(), 'copperhead-crossing-proof-'));
       try {
+        const symSource = new SymbolSource(buckDir, [path.join(buckDir, 'sym-lib-cache')], false);
+        const v = await validateIntent(intent, symSource, null);
+        expect(v.ok).toBe(true);
+        const { model, report } = draftSchematicPlacement(v.validated!, 'board', '2020-01-01');
+
         expect(report.mergedNets).toEqual([]);
 
-        // For each emitted label, ensure its anchor point does NOT lie on any foreign wire
+        // 1. Locate the horizontal BOOT wire and the crossing vertical SW wire
+        const bootHorizWire = model.wires.find(
+          (w) => w.net === 'BOOT' && sameCoord(w.y1, 49.53) && sameCoord(w.y2, 49.53),
+        );
+        expect(bootHorizWire).toBeDefined();
+        const swVertWire = model.wires.find(
+          (w) => w.net === 'SW' && sameCoord(w.x1, 129.54) && sameCoord(w.x2, 129.54),
+        );
+        expect(swVertWire).toBeDefined();
+
+        // 2. Prove that the crossing point (129.54, 49.53) lies on the BOOT horizontal segment
+        const crossX = 129.54;
+        const crossY = 49.53;
+        const onBoot = pointOnSeg(crossX, crossY, bootHorizWire!.x1, bootHorizWire!.y1, bootHorizWire!.x2, bootHorizWire!.y2);
+        expect(onBoot).toBe(true);
+
+        // 3. Prove that (129.54, 49.53) lies on the foreign SW vertical wire
+        const onSw = pointOnSeg(crossX, crossY, swVertWire!.x1, swVertWire!.y1, swVertWire!.x2, swVertWire!.y2);
+        expect(onSw).toBe(true);
+
+        // 4. Prove that (crossX, crossY) is an exact candidate in horizPts grid steps
+        const minX = Math.min(bootHorizWire!.x1, bootHorizWire!.x2);
+        const steps = (crossX - minX) / U;
+        expect(Math.abs(steps - Math.round(steps))).toBeLessThan(1e-5);
+
+        // 5. Assert that no label anchor for BOOT sits on (129.54, 49.53) or any foreign wire
         for (const l of model.labels) {
           const foreignWires = model.wires.filter((w) => w.net !== l.name);
           for (const fw of foreignWires) {
@@ -972,7 +1042,7 @@ describe('schematic readability & wiring quality (#219)', () => {
           }
         }
 
-        // Netlist verification via kicad-cli oracle confirms nets remain separate
+        // 6. Netlist round-trip verification via kicad-cli confirms BOOT and SW remain separate partitions
         const schText = emitSchematic(model);
         const schPath = path.join(workDir, 'board.kicad_sch');
         await writeFile(schPath, schText, 'utf8');
@@ -980,9 +1050,13 @@ describe('schematic readability & wiring quality (#219)', () => {
         await execa('kicad-cli', ['sch', 'export', 'netlist', '--output', netPath, schPath]);
         const backNl = parseNetlist(await readFile(netPath, 'utf8'));
         const parts = netPartition(backNl);
-        // NET_A pins and NET_B pins must not be merged into the same partition
-        expect(parts.has('R1.2|R3.1')).toBe(true);
-        expect(parts.has('R2.2|R4.1')).toBe(true);
+        // BOOT pins (U1.1, C4.1) and SW pins (U1.8, C4.2) must not be merged into the same partition
+        expect(parts.has('C4.1|U1.1') || parts.has('U1.1|C4.1')).toBe(true);
+        for (const part of parts) {
+          const hasBoot = part.includes('U1.1') || part.includes('C4.1');
+          const hasSw = part.includes('U1.8') || part.includes('C4.2');
+          expect(hasBoot && hasSw, 'BOOT and SW must not be merged into the same partition').toBe(false);
+        }
       } finally {
         await rm(workDir, { recursive: true, force: true });
       }
