@@ -50,9 +50,10 @@ describe('schematic readability & wiring quality (#219)', () => {
     expect(netLabels.every((l) => l.kind !== 'global')).toBe(true);
   });
 
-  it('keeps fully-wired short anonymous net unlabelled when no anchor clears symbol bodies', async () => {
-    // An anonymous net connecting two series passives with tight pin spacing
-    // must not force a colliding local label over the component body.
+  it('places labels on wired anonymous runs while clearing bodies via rot 180 or valid anchors', async () => {
+    // Under AC-16.37, every wired run has one label. The engine evaluates
+    // alternative orientations (rot: 180) and positions to place the label
+    // without colliding with adjacent component bodies.
     const intent: SchematicIntent = {
       version: 1,
       parts: [
@@ -64,9 +65,12 @@ describe('schematic readability & wiring quality (#219)', () => {
       ],
     };
 
-    const { report } = await place(intent);
+    const { model, report } = await place(intent);
     expect(report.mergedNets).toEqual([]);
     expect(report.labelsOverBodies).toBe(0);
+    const netLabel = model.labels.find((l) => l.name === 'Net-(R1-Pad2)');
+    expect(netLabel).toBeDefined();
+    expect(netLabel?.kind).toBe('local');
   });
 
   it('preserves user-named net labels on wired runs while avoiding bodies', async () => {

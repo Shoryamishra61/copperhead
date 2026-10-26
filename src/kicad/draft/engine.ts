@@ -5099,11 +5099,6 @@ function draftOnce(
       const at0 = candidates.find((p) => clearOfBodies(p, 0));
       const at180 = !at0 ? candidates.find((p) => clearOfBodies(p, 180)) : undefined;
       const at = at0 ? { ...at0, rot: 0 } : at180 ? { ...at180, rot: 180 } : undefined;
-      if (!at && net.name.startsWith('Net-(') && subset.length === eps.length) {
-        trace(`wired net ${net.name}: no clear label anchor on short run; keeping wire unlabelled`);
-        wired++;
-        return;
-      }
       const chosenAt = at ?? { ...pts[0]!, rot: 0 };
       labels.push({ name: net.name, x: chosenAt.x, y: chosenAt.y, rot: chosenAt.rot, kind: 'local' });
       netWired.push(labels.length - 1);
