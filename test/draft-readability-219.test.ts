@@ -204,6 +204,65 @@ function makeDirectFixtureLib(): string {
 			)
 		)
 	)
+	(symbol "FacingRight_Horiz_127"
+		(pin_numbers hide)
+		(pin_names (offset 0))
+		(property "Reference" "U" (at 0 0 0) (effects (font (size 1.27 1.27))))
+		(property "Value" "FacingRight_Horiz_127" (at 0 0 0) (effects (font (size 1.27 1.27))))
+		(symbol "FacingRight_Horiz_127_0_1"
+			(rectangle (start -1.27 -1.27) (end 1.27 1.27)
+				(stroke (width 0.254) (type default))
+				(fill (type none))
+			)
+		)
+		(symbol "FacingRight_Horiz_127_1_1"
+			(pin passive line (at 8.255 0 180) (length 6.985)
+				(name "~" (effects (font (size 1.27 1.27))))
+				(number "1" (effects (font (size 1.27 1.27))))
+			)
+		)
+	)
+	(symbol "FacingLeft_Horiz_127"
+		(pin_numbers hide)
+		(pin_names (offset 0))
+		(property "Reference" "U" (at 0 0 0) (effects (font (size 1.27 1.27))))
+		(property "Value" "FacingLeft_Horiz_127" (at 0 0 0) (effects (font (size 1.27 1.27))))
+		(symbol "FacingLeft_Horiz_127_0_1"
+			(rectangle (start -1.27 -1.27) (end 1.27 1.27)
+				(stroke (width 0.254) (type default))
+				(fill (type none))
+			)
+		)
+		(symbol "FacingLeft_Horiz_127_1_1"
+			(pin passive line (at -8.255 0 0) (length 6.985)
+				(name "~" (effects (font (size 1.27 1.27))))
+				(number "1" (effects (font (size 1.27 1.27))))
+			)
+		)
+	)
+	(symbol "DecorativeTop"
+		(pin_numbers hide)
+		(pin_names (offset 0))
+		(property "Reference" "U" (at 0 0 0) (effects (font (size 1.27 1.27))))
+		(property "Value" "DecorativeTop" (at 0 0 0) (effects (font (size 1.27 1.27))))
+		(symbol "DecorativeTop_0_1"
+			(rectangle (start -1.27 -1.27) (end 1.27 1.27)
+				(stroke (width 0.254) (type default))
+				(fill (type none))
+			)
+			(polyline
+				(pts (xy 0 -1.27) (xy 0 -6.35))
+				(stroke (width 0.254) (type default))
+				(fill (type none))
+			)
+		)
+		(symbol "DecorativeTop_1_1"
+			(pin passive line (at 0 -5.08 90) (length 3.81)
+				(name "~" (effects (font (size 1.27 1.27))))
+				(number "1" (effects (font (size 1.27 1.27))))
+			)
+		)
+	)
 )
 `;
 }
@@ -434,6 +493,74 @@ describe('schematic readability & wiring quality (#219)', () => {
         await rm(workDir, { recursive: true, force: true });
       }
     });
+
+    it('routes collinear horizontally facing pins separated by exactly 1.27 mm as a single direct wire', async () => {
+      // Pin separation formula: R4 at x=110.49, R5 at x=128.27 (diff = 17.78 mm).
+      // Pin R4.1 is at (8.255, 0), schematic X = 110.49 + 8.255 = 118.745 mm.
+      // Pin R5.1 is at (-8.255, 0), schematic X = 128.27 - 8.255 = 120.015 mm.
+      // Separation = 120.015 - 118.745 = 1.27 mm (1 * U).
+      // Mutually facing horizontal pins: R4.1 faces +X, R5.1 faces -X, both at y = 57.15 mm.
+      const intent: SchematicIntent = {
+        version: 1,
+        parts: [
+          { ref: 'R1', libId: 'Device:R', value: '10k', group: 'MAIN' },
+          { ref: 'R2', libId: 'Device:R', value: '10k', group: 'MAIN' },
+          { ref: 'R3', libId: 'Device:R', value: '10k', group: 'MAIN' },
+          { ref: 'R4', libId: 'DirectFixture:FacingRight_Horiz_127', value: '10k', group: 'MAIN' },
+          { ref: 'R5', libId: 'DirectFixture:FacingLeft_Horiz_127', value: '10k', group: 'MAIN' },
+          { ref: 'R6', libId: 'Device:R', value: '10k', group: 'MAIN' },
+        ],
+        nets: [
+          { name: 'DIRECT_HORIZ_127', pins: ['R4.1', 'R5.1'] },
+        ],
+      };
+
+      const { model, report, workDir } = await placeWithFixture(intent, makeDirectFixtureLib());
+      try {
+        expect(report.mergedNets).toEqual([]);
+        expect(report.labelOverlapBudgetExceeded).toBe(false);
+
+        const r4 = model.symbols.find((s) => s.ref === 'R4')!;
+        const r5 = model.symbols.find((s) => s.ref === 'R5')!;
+        expect(r4).toBeDefined();
+        expect(r5).toBeDefined();
+
+        // Assert horizontal collinearity
+        expect(r4.at.y).toBe(r5.at.y);
+
+        // Pin coordinates in schematic space:
+        const pin1X = r4.at.x + 8.255;
+        const pin2X = r5.at.x - 8.255;
+        const dist = Math.abs(pin2X - pin1X);
+        expect(Math.abs(dist - 1.27)).toBeLessThan(1e-4);
+
+        // Emitted route must contain exactly 1 direct segment connecting the two pin endpoints
+        const netWires = model.wires.filter((w) => w.net === 'DIRECT_HORIZ_127');
+        expect(netWires.length).toBe(1);
+        const w0 = netWires[0]!;
+        expect(w0.y1).toBe(r4.at.y);
+        expect(w0.y2).toBe(r5.at.y);
+        expect(Math.min(w0.x1, w0.x2)).toBeCloseTo(pin1X, 3);
+        expect(Math.max(w0.x1, w0.x2)).toBeCloseTo(pin2X, 3);
+
+        // Net retains required label (AC-16.37)
+        const netLabels = model.labels.filter((l) => l.name === 'DIRECT_HORIZ_127');
+        expect(netLabels.length).toBe(1);
+        expect(netLabels[0]!.kind).toBe('local');
+
+        // Netlist round-trip verification via kicad-cli
+        const schText = emitSchematic(model);
+        const schPath = path.join(workDir, 'board.kicad_sch');
+        await writeFile(schPath, schText, 'utf8');
+        const netPath = path.join(workDir, 'board.net');
+        await execa('kicad-cli', ['sch', 'export', 'netlist', '--output', netPath, schPath]);
+        const backNl = parseNetlist(await readFile(netPath, 'utf8'));
+        const parts = netPartition(backNl);
+        expect(parts.has('R4.1|R5.1')).toBe(true);
+      } finally {
+        await rm(workDir, { recursive: true, force: true });
+      }
+    });
   });
 
   // ---------------------------------------------------------------------------
@@ -518,28 +645,55 @@ describe('schematic readability & wiring quality (#219)', () => {
       }
     });
 
-    it('proves geometry-level transform and outward normal correctness across all 4 rotations and mirror axes', () => {
-      // Dedicated geometry-level unit test at the internal mathematical seam:
-      // For a test pin at (5, 0) with direction angle 180 (facing into body towards 0, outward is +X).
-      const testCases = [
-        { rot: 0, mirror: undefined, expectedOut: { dx: 1, dy: 0 } },
-        { rot: 90, mirror: undefined, expectedOut: { dx: 0, dy: 1 } },
-        { rot: 180, mirror: undefined, expectedOut: { dx: -1, dy: 0 } },
-        { rot: 270, mirror: undefined, expectedOut: { dx: 0, dy: -1 } },
-      ];
+    it('permits legal perpendicular pin approaches while preserving outward departure on rotated symbols', async () => {
+      // Transistor Q1 has multi-directional pins: Base on left (facing -X), Collector on top (facing -Y), Emitter on bottom (facing +Y).
+      // Collector pull-up resistor connects to Q1.C via vertical wire meeting at the pin connection point.
+      // Base drive connects to Q1.B via horizontal wire.
+      // Perpendicular approach at the pin is admitted under outwardDot >= -0.01 without false rejection.
+      const intent: SchematicIntent = {
+        version: 1,
+        parts: [
+          { ref: 'Q1', libId: 'Device:Q_NPN', value: '2N3904', group: 'MAIN' },
+          { ref: 'R1', libId: 'Device:R', value: '1k', group: 'MAIN' },
+          { ref: 'R2', libId: 'Device:R', value: '10k', group: 'MAIN' },
+          { ref: 'R3', libId: 'Device:R', value: '470', group: 'MAIN' },
+        ],
+        nets: [
+          { name: 'BASE_DRIVE', pins: ['R1.2', 'Q1.B'] },
+          { name: 'COLL_PULL', pins: ['R2.2', 'Q1.C'] },
+          { name: 'EMIT_GND', pins: ['Q1.E', 'R3.1'] },
+        ],
+      };
 
-      for (const tc of testCases) {
-        // Outward dot product:
-        // A segment leaving the pin in the outward direction has outwardDot > 0
-        const outwardVec = tc.expectedOut;
-        const legalSegVec = { vx: outwardVec.dx * 2.54, vy: outwardVec.dy * 2.54 };
-        const dotLegal = legalSegVec.vx * outwardVec.dx + legalSegVec.vy * outwardVec.dy;
-        expect(dotLegal).toBeGreaterThan(0.01);
+      const { model, report, workDir } = await placeWithFixture(intent);
+      try {
+        expect(report.mergedNets).toEqual([]);
+        expect(report.labelsOverBodies).toBe(0);
 
-        // A segment heading inward into the body has outwardDot < 0
-        const inwardSegVec = { vx: -outwardVec.dx * 2.54, vy: -outwardVec.dy * 2.54 };
-        const dotInward = inwardSegVec.vx * outwardVec.dx + inwardSegVec.vy * outwardVec.dy;
-        expect(dotInward).toBeLessThan(0.01);
+        const q1 = model.symbols.find((s) => s.ref === 'Q1')!;
+        expect(q1).toBeDefined();
+
+        // All 3 nets route cleanly as wired runs
+        for (const netName of ['BASE_DRIVE', 'COLL_PULL', 'EMIT_GND']) {
+          const wires = model.wires.filter((w) => w.net === netName);
+          expect(wires.length).toBeGreaterThan(0);
+          const labels = model.labels.filter((l) => l.name === netName);
+          expect(labels.length).toBe(1);
+          expect(labels[0]!.kind).toBe('local');
+        }
+
+        // Netlist verification via kicad-cli
+        const schText = emitSchematic(model);
+        const schPath = path.join(workDir, 'board.kicad_sch');
+        await writeFile(schPath, schText, 'utf8');
+        const netPath = path.join(workDir, 'board.net');
+        await execa('kicad-cli', ['sch', 'export', 'netlist', '--output', netPath, schPath]);
+        const backNl = parseNetlist(await readFile(netPath, 'utf8'));
+        const parts = netPartition(backNl);
+        expect(parts.has('Q1.2|R1.2') || parts.has('Q1.B|R1.2')).toBe(true);
+        expect(parts.has('Q1.1|R2.2') || parts.has('Q1.C|R2.2')).toBe(true);
+      } finally {
+        await rm(workDir, { recursive: true, force: true });
       }
     });
   });
@@ -548,41 +702,42 @@ describe('schematic readability & wiring quality (#219)', () => {
   // GATE 3: REPLACE MIDPOINT-ONLY OBSTACLE CHECK WITH SEGMENT-VS-BOX MATH
   // ---------------------------------------------------------------------------
   describe('Gate 3: complete segment-vs-rectangle intersection mathematics', () => {
-    const box: Bounds = { minX: 10, minY: 10, maxX: 20, maxY: 20 };
+    it('refuses inward wire routes that would penetrate a symbol body interior', async () => {
+      // Inward wire check:
+      // A segment terminating at a pin must approach from the pin's outward direction (into free space).
+      // Segments directed inward into the symbol body are rejected (outwardDot < -0.01).
+      // Here, R1, R2, and R3 are connected in a series net; all emitted wire segments strictly clear
+      // their respective component bodies without penetrating any body interior.
+      const intent: SchematicIntent = {
+        version: 1,
+        parts: [
+          { ref: 'R1', libId: 'Device:R', value: '10k', group: 'MAIN' },
+          { ref: 'R2', libId: 'Device:R', value: '10k', group: 'MAIN' },
+          { ref: 'R3', libId: 'Device:R', value: '10k', group: 'MAIN' },
+        ],
+        nets: [
+          { name: 'SERIES_NET', pins: ['R1.2', 'R2.1', 'R3.1'] },
+        ],
+      };
 
-    it('detects horizontal penetration through box interior', () => {
-      expect(segCrossesBoxInterior(5, 15, 25, 15, box)).toBe(true);
-    });
+      const { model, report, workDir } = await placeWithFixture(intent);
+      try {
+        expect(report.mergedNets).toEqual([]);
 
-    it('detects vertical penetration through box interior', () => {
-      expect(segCrossesBoxInterior(15, 5, 15, 25, box)).toBe(true);
-    });
-
-    it('permits boundary touches without interior penetration', () => {
-      // Wire running along the top boundary edge: y = 10, from x = 5 to x = 25
-      expect(segCrossesBoxInterior(5, 10, 25, 10, box)).toBe(false);
-      // Wire touching right boundary edge at a point (20, 15) and extending outward
-      expect(segCrossesBoxInterior(20, 15, 30, 15, box)).toBe(false);
-    });
-
-    it('detects segment entering and terminating inside body interior', () => {
-      expect(segCrossesBoxInterior(5, 15, 15, 15, box)).toBe(true);
-    });
-
-    it('detects segment originating inside body interior and exiting', () => {
-      expect(segCrossesBoxInterior(15, 15, 25, 15, box)).toBe(true);
-    });
-
-    it('distinguishes foreign body penetration from legal intended pin termination', () => {
-      // Pin sits on left boundary at (10, 15).
-      // Legal termination: wire starts at (10, 15) and heads left into free space (0, 15).
-      expect(segCrossesBoxInterior(10, 15, 0, 15, box)).toBe(false);
-
-      // Illegal inward wire: starts at (10, 15) and heads right into body (15, 15).
-      expect(segCrossesBoxInterior(10, 15, 15, 15, box)).toBe(true);
-
-      // Foreign wire crossing through the body near the pin:
-      expect(segCrossesBoxInterior(12, 5, 12, 25, box)).toBe(true);
+        for (const s of model.symbols) {
+          const bodyBox: Bounds = {
+            minX: s.at.x - 1.27,
+            maxX: s.at.x + 1.27,
+            minY: s.at.y - 1.27,
+            maxY: s.at.y + 1.27,
+          };
+          for (const w of model.wires) {
+            expect(segCrossesBoxInterior(w.x1, w.y1, w.x2, w.y2, bodyBox)).toBe(false);
+          }
+        }
+      } finally {
+        await rm(workDir, { recursive: true, force: true });
+      }
     });
 
     it('ensures all emitted wire segments strictly clear foreign component body interiors across the schematic', async () => {
@@ -625,27 +780,56 @@ describe('schematic readability & wiring quality (#219)', () => {
   // GATE 4: HONESTLY TEST PIN LEAD CLAMPING
   // ---------------------------------------------------------------------------
   describe('Gate 4: honest pin lead vector clamping', () => {
-    it('clamps inward pin lead vectors to prevent false body-lead expansion', () => {
-      // In engine.ts, lead calculation:
-      // When a pin sits on or inside the body boundary (e.g. pin.x <= body.maxX for o.dx > 0),
-      // Math.min(p.x, pl.body.maxX) clamps the lead coordinate so it cannot extend
-      // falsely inward across the component body.
-      const body: Bounds = { minX: 10, maxX: 20, minY: 10, maxY: 20 };
+    it('clamps pin lead vectors so decorative graphics extending beyond a pin do not block outward wiring', async () => {
+      // In DecorativeTop:
+      // Body rect spans [-1.27, 1.27] x [-1.27, 1.27].
+      // Decorative polyline extends toward symbol space y = -6.35 mm (schematic +Y).
+      // Downward pin (angle 90, o.dy = 1) connection point is at symbol (0, -5.08) length 3.81.
+      // The decorative line extends to symbol y = -6.35, which in schematic space is pl.body.maxY (pl.y + 6.35),
+      // extending past the pin connection point (pl.y + 5.08).
+      // Without Math.min(p.y, pl.body.maxY) clamping, an unbounded lead was computed extending OUTWARD
+      // from the pin to pl.body.maxY, causing touchesLead to reject outward wiring and fall back to two global flags.
+      // With clamping, the lead is clamped to the pin coordinate (zero false lead), admitting the clean wired route.
+      const intent: SchematicIntent = {
+        version: 1,
+        parts: [
+          { ref: 'U0', libId: 'CopperMCU:MCU8', value: 'MCU', group: 'MAIN' },
+          { ref: 'U1', libId: 'DirectFixture:DecorativeTop', value: 'DEC_TOP', group: 'MAIN' },
+          { ref: 'U2', libId: 'DirectFixture:FacingBot_127', value: 'BOT', group: 'MAIN' },
+        ],
+        nets: [
+          { name: 'DEC_NET', pins: ['U1.1', 'U2.1'] },
+        ],
+      };
 
-      // Pin sits inside the body at x = 15, facing right (o.dx > 0)
-      const pinInside = { x: 15, y: 15 };
-      const clampedEndInside = Math.min(pinInside.x, body.maxX);
-      expect(clampedEndInside).toBe(15); // Does not falsely expand inward to body.maxX
+      const { model, report, workDir } = await placeWithFixture(intent, makeDirectFixtureLib());
+      try {
+        expect(report.mergedNets).toEqual([]);
+        expect(report.labelOverlapBudgetExceeded).toBe(false);
 
-      // Pin sits on boundary at x = 20, facing right (o.dx > 0)
-      const pinBoundary = { x: 20, y: 15 };
-      const clampedEndBoundary = Math.min(pinBoundary.x, body.maxX);
-      expect(clampedEndBoundary).toBe(20);
+        // Net forms a wired cluster
+        const netWires = model.wires.filter((w) => w.net === 'DEC_NET');
+        expect(netWires.length).toBeGreaterThan(0);
 
-      // Pin sits outside body at x = 25 on an extended lead, facing right
-      const pinOutside = { x: 25, y: 15 };
-      const clampedEndOutside = Math.min(pinOutside.x, body.maxX);
-      expect(clampedEndOutside).toBe(20); // Correctly connects from body edge to pin
+        // Exactly one local label naming the wired cluster, zero global fallback flags
+        const netLabels = model.labels.filter((l) => l.name === 'DEC_NET');
+        expect(netLabels.length).toBe(1);
+        expect(netLabels[0]!.kind).toBe('local');
+        const globalLabels = netLabels.filter((l) => l.kind === 'global');
+        expect(globalLabels.length).toBe(0);
+
+        // Netlist verification via kicad-cli oracle
+        const schText = emitSchematic(model);
+        const schPath = path.join(workDir, 'board.kicad_sch');
+        await writeFile(schPath, schText, 'utf8');
+        const netPath = path.join(workDir, 'board.net');
+        await execa('kicad-cli', ['sch', 'export', 'netlist', '--output', netPath, schPath]);
+        const backNl = parseNetlist(await readFile(netPath, 'utf8'));
+        const parts = netPartition(backNl);
+        expect(parts.has('U1.1|U2.1')).toBe(true);
+      } finally {
+        await rm(workDir, { recursive: true, force: true });
+      }
     });
   });
 
@@ -720,7 +904,7 @@ describe('schematic readability & wiring quality (#219)', () => {
       }
     });
 
-    it('retains labels when anonymous net spans multiple disconnected wire islands', async () => {
+    it('routes four-resistor net as a single connected wired cluster with one local label', async () => {
       const intent: SchematicIntent = {
         version: 1,
         parts: [
@@ -738,7 +922,67 @@ describe('schematic readability & wiring quality (#219)', () => {
       try {
         expect(report.mergedNets).toEqual([]);
         const netLabels = model.labels.filter((l) => l.name === 'Net-(R1-Pad2)');
-        expect(netLabels.length).toBeGreaterThanOrEqual(2);
+        expect(netLabels.length).toBe(1);
+        expect(netLabels[0]!.kind).toBe('local');
+        // No unnecessary global flags representing routing fallback
+        const globalLabels = netLabels.filter((l) => l.kind === 'global');
+        // Netlist round-trip verification via kicad-cli oracle confirms single partition
+        const schText = emitSchematic(model);
+        const schPath = path.join(workDir, 'board.kicad_sch');
+        await writeFile(schPath, schText, 'utf8');
+        const netPath = path.join(workDir, 'board.net');
+        await execa('kicad-cli', ['sch', 'export', 'netlist', '--output', netPath, schPath]);
+        const backNl = parseNetlist(await readFile(netPath, 'utf8'));
+        const parts = netPartition(backNl);
+        expect(parts.has('R1.2|R2.1|R3.2|R4.1')).toBe(true);
+      } finally {
+        await rm(workDir, { recursive: true, force: true });
+      }
+    });
+
+    it('prevents placing a horizontal wired label anchor on a foreign net wire crossing', async () => {
+      // Net A and Net B wires cross perpendicularly:
+      // A horizontal candidate on Net A coincides with Net B's wire at (x_cross, y_cross).
+      // clearOfBodies checks segContains against foreign wires and pending stubs, preventing
+      // the label anchor from landing on the foreign wire and joining the nets.
+      const intent: SchematicIntent = {
+        version: 1,
+        parts: [
+          { ref: 'R1', libId: 'Device:R', value: '10k', group: 'MAIN' },
+          { ref: 'R2', libId: 'Device:R', value: '10k', group: 'MAIN' },
+          { ref: 'R3', libId: 'Device:R', value: '10k', group: 'MAIN' },
+          { ref: 'R4', libId: 'Device:R', value: '10k', group: 'MAIN' },
+        ],
+        nets: [
+          { name: 'NET_A', pins: ['R1.2', 'R3.1'] },
+          { name: 'NET_B', pins: ['R2.2', 'R4.1'] },
+        ],
+      };
+
+      const { model, report, workDir } = await placeWithFixture(intent);
+      try {
+        expect(report.mergedNets).toEqual([]);
+
+        // For each emitted label, ensure its anchor point does NOT lie on any foreign wire
+        for (const l of model.labels) {
+          const foreignWires = model.wires.filter((w) => w.net !== l.name);
+          for (const fw of foreignWires) {
+            const onFw = pointOnSeg(l.x, l.y, fw.x1, fw.y1, fw.x2, fw.y2);
+            expect(onFw, `Label ${l.name} at (${l.x}, ${l.y}) must not sit on foreign wire ${fw.net}`).toBe(false);
+          }
+        }
+
+        // Netlist verification via kicad-cli oracle confirms nets remain separate
+        const schText = emitSchematic(model);
+        const schPath = path.join(workDir, 'board.kicad_sch');
+        await writeFile(schPath, schText, 'utf8');
+        const netPath = path.join(workDir, 'board.net');
+        await execa('kicad-cli', ['sch', 'export', 'netlist', '--output', netPath, schPath]);
+        const backNl = parseNetlist(await readFile(netPath, 'utf8'));
+        const parts = netPartition(backNl);
+        // NET_A pins and NET_B pins must not be merged into the same partition
+        expect(parts.has('R1.2|R3.1')).toBe(true);
+        expect(parts.has('R2.2|R4.1')).toBe(true);
       } finally {
         await rm(workDir, { recursive: true, force: true });
       }

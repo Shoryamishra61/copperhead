@@ -927,6 +927,14 @@ const segCrossesBody = (x1: number, y1: number, x2: number, y2: number, b: Bound
   return inX && inY; // conservative for diagonals (the engine never draws them)
 };
 
+/** Is (x, y) on the (axis-aligned) segment, endpoints included? */
+const segContains = (w: { x1: number; y1: number; x2: number; y2: number }, x: number, y: number): boolean =>
+  x >= Math.min(w.x1, w.x2) - 0.01 &&
+  x <= Math.max(w.x1, w.x2) + 0.01 &&
+  y >= Math.min(w.y1, w.y2) - 0.01 &&
+  y <= Math.max(w.y1, w.y2) + 0.01 &&
+  (Math.abs(w.x1 - w.x2) < 0.01 ? Math.abs(x - w.x1) <= 0.01 : Math.abs(y - w.y1) <= 0.01);
+
 /**
  * Draft, then check the drawn group boxes against one another: a box grows
  * past its tiling estimate when the text it must hold (a flag on a hung
@@ -4852,7 +4860,7 @@ function draftOnce(
                 // legal outward direction into free space. A wire heading inward
                 // into the symbol body or running along the body edge is refused.
                 const outwardDot = vx * p.out.dx + vy * p.out.dy;
-                if (outwardDot < 0.01) return false;
+                if (outwardDot < -0.01) return false;
               }
             }
             if (!touchesOwnedPin && segCrossesBody(c.x1, c.y1, c.x2, c.y2, pl.body)) {
@@ -5092,6 +5100,8 @@ function draftOnce(
         };
       };
       const clearOfBodies = (pt: { x: number; y: number }, rot = 0): boolean => {
+        if (wires.some((w) => w.net !== net.name && segContains(w, pt.x, pt.y))) return false;
+        if (pendingStubs.some((st) => st.net !== net.name && segContains(st, pt.x, pt.y))) return false;
         const b = labelTextBox(net.name, pt.x, pt.y, rot);
         if ([...placed.values()].some((pl) => boundsOverlap(b, withLeads(pl)))) return false;
         return !labels.some((o) => o.name !== net.name && boundsOverlap(padBox(b), labelTextBox(o.name, o.x, o.y, o.rot)));
@@ -5639,13 +5649,7 @@ function draftOnce(
     Math.max(w.x1, w.x2) > b.minX + 0.01 &&
     Math.min(w.y1, w.y2) < b.maxY - 0.01 &&
     Math.max(w.y1, w.y2) > b.minY + 0.01;
-  /** Is (x, y) on the (axis-aligned) segment, endpoints included? */
-  const segContains = (w: { x1: number; y1: number; x2: number; y2: number }, x: number, y: number): boolean =>
-    x >= Math.min(w.x1, w.x2) - 0.01 &&
-    x <= Math.max(w.x1, w.x2) + 0.01 &&
-    y >= Math.min(w.y1, w.y2) - 0.01 &&
-    y <= Math.max(w.y1, w.y2) + 0.01 &&
-    (Math.abs(w.x1 - w.x2) < 0.01 ? Math.abs(x - w.x1) <= 0.01 : Math.abs(y - w.y1) <= 0.01);
+
 
   // Wired-net labels first: the single label naming a wired run used to be
   // pinned at the topmost-leftmost wire point with no clearance check, and on
