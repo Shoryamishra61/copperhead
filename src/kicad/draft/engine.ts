@@ -1438,7 +1438,7 @@ function draftFitted(validated: ValidatedIntent, projectName: string, today: str
   return { model: out.model, report: out.report };
 }
 
-export function draftOnce(
+function draftOnce(
   validated: ValidatedIntent,
   projectName: string,
   today: string,
@@ -4746,7 +4746,10 @@ export function draftOnce(
   const bodies = [...placed.values()].map((p) => p.body);
   const placedList = [...placed.values()].map((pl) => ({
     body: pl.body,
-    pins: pl.sym.pins.map((pin) => pinAt(pl, pin)),
+    pins: pl.sym.pins.map((pin) => ({
+      pt: pinAt(pl, pin),
+      out: outward(pin),
+    })),
   }));
   // Every signal pin's stub, drawn or not yet: a route is judged against the
   // stubs of nets drafted after it as well as the wires of those before. A
@@ -4837,10 +4840,24 @@ export function draftOnce(
       const admit = (candidate: RouteSeg[]): boolean => {
         for (const c of candidate) {
           for (const pl of placedList) {
-            const endsOnPin = pl.pins.some(
-              (p) => (sameCoord(p.x, c.x1) && sameCoord(p.y, c.y1)) || (sameCoord(p.x, c.x2) && sameCoord(p.y, c.y2)),
-            );
-            if (!endsOnPin && segCrossesBody(c.x1, c.y1, c.x2, c.y2, pl.body)) return false;
+            let touchesOwnedPin = false;
+            for (const p of pl.pins) {
+              const at1 = sameCoord(p.pt.x, c.x1) && sameCoord(p.pt.y, c.y1);
+              const at2 = sameCoord(p.pt.x, c.x2) && sameCoord(p.pt.y, c.y2);
+              if (at1 || at2) {
+                touchesOwnedPin = true;
+                const vx = at1 ? c.x2 - c.x1 : c.x1 - c.x2;
+                const vy = at1 ? c.y2 - c.y1 : c.y1 - c.y2;
+                // A segment terminating at a pin must approach from the pin's
+                // legal outward direction into free space. A wire heading inward
+                // into the symbol body or running along the body edge is refused.
+                const outwardDot = vx * p.out.dx + vy * p.out.dy;
+                if (outwardDot < 0.01) return false;
+              }
+            }
+            if (!touchesOwnedPin && segCrossesBody(c.x1, c.y1, c.x2, c.y2, pl.body)) {
+              return false;
+            }
           }
           if (touchesLead(c)) return false;
         }
@@ -5074,19 +5091,21 @@ export function draftOnce(
           maxY: Math.max(pl.body.maxY, ...pts.map((q) => q.y)),
         };
       };
-      const clearOfBodies = (pt: { x: number; y: number }): boolean => {
-        const b = labelTextBox(net.name, pt.x, pt.y, 0);
+      const clearOfBodies = (pt: { x: number; y: number }, rot = 0): boolean => {
+        const b = labelTextBox(net.name, pt.x, pt.y, rot);
         if ([...placed.values()].some((pl) => boundsOverlap(b, withLeads(pl)))) return false;
         return !labels.some((o) => o.name !== net.name && boundsOverlap(padBox(b), labelTextBox(o.name, o.x, o.y, o.rot)));
       };
-      const at = candidates.find(clearOfBodies);
+      const at0 = candidates.find((p) => clearOfBodies(p, 0));
+      const at180 = !at0 ? candidates.find((p) => clearOfBodies(p, 180)) : undefined;
+      const at = at0 ? { ...at0, rot: 0 } : at180 ? { ...at180, rot: 180 } : undefined;
       if (!at && net.name.startsWith('Net-(') && subset.length === eps.length) {
         trace(`wired net ${net.name}: no clear label anchor on short run; keeping wire unlabelled`);
         wired++;
         return;
       }
-      const chosenAt = at ?? pts[0]!;
-      labels.push({ name: net.name, x: chosenAt.x, y: chosenAt.y, rot: 0, kind: 'local' });
+      const chosenAt = at ?? { ...pts[0]!, rot: 0 };
+      labels.push({ name: net.name, x: chosenAt.x, y: chosenAt.y, rot: chosenAt.rot, kind: 'local' });
       netWired.push(labels.length - 1);
       wiredLabels.push({ label: labels.length - 1, pts, segs: r.segs.map((c) => ({ ...c })) });
       wired++;
