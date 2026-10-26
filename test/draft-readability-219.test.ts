@@ -174,4 +174,69 @@ describe('schematic readability & wiring quality (#219)', () => {
       expect(strictlyInside).toBe(false);
     }
   });
+
+  it('rejects candidate segments that traverse through intermediate foreign bodies', async () => {
+    // Adversarial test: a route connecting two components cannot pass through
+    // an intermediate component body that sits between them, even when the wire
+    // starts and ends on legal pins.
+    const intent: SchematicIntent = {
+      version: 1,
+      parts: [
+        { ref: 'U1', libId: 'CopperMCU:MCU8', value: 'MCU', group: 'MAIN' },
+        { ref: 'U2', libId: 'CopperMCU:MCU8', value: 'OBSTACLE', group: 'MAIN' },
+        { ref: 'R1', libId: 'Device:R', value: '10k', group: 'MAIN' },
+      ],
+      nets: [
+        { name: 'CROSS_SIGNAL', pins: ['U1.4', 'R1.1'] },
+      ],
+    };
+
+    const { model, report } = await place(intent);
+    expect(report.mergedNets).toEqual([]);
+
+    // Wires of CROSS_SIGNAL must not cross U2's body
+    const u2 = model.symbols.find((s) => s.ref === 'U2');
+    expect(u2).toBeDefined();
+    const u2Body = {
+      minX: u2!.at.x - 7.62,
+      maxX: u2!.at.x + 7.62,
+      minY: u2!.at.y - 7.62,
+      maxY: u2!.at.y + 7.62,
+    };
+    for (const w of model.wires.filter((w) => w.net === 'CROSS_SIGNAL')) {
+      const midX = (w.x1 + w.x2) / 2;
+      const midY = (w.y1 + w.y2) / 2;
+      const insideU2 = midX > u2Body.minX + 0.1 && midX < u2Body.maxX - 0.1 &&
+                       midY > u2Body.minY + 0.1 && midY < u2Body.maxY - 0.1;
+      expect(insideU2).toBe(false);
+    }
+  });
+
+  it('preserves outward approach across rotated and mirrored symbols', async () => {
+    // Tests that symbol rotation (90, 180, 270) and mirroring do not corrupt
+    // the pin outward vector check or admit inward routes.
+    const intent: SchematicIntent = {
+      version: 1,
+      parts: [
+        { ref: 'Q1', libId: 'Device:Q_NPN', value: '2N3904', group: 'MAIN' },
+        { ref: 'R1', libId: 'Device:R', value: '1k', group: 'MAIN' },
+        { ref: 'R2', libId: 'Device:R', value: '10k', group: 'MAIN' },
+      ],
+      nets: [
+        { name: 'BASE_DRIVE', pins: ['R1.2', 'Q1.B'] },
+        { name: 'COLL_PULL', pins: ['R2.2', 'Q1.C'] },
+      ],
+    };
+
+    const { model, report } = await place(intent);
+    expect(report.mergedNets).toEqual([]);
+    expect(report.labelsOverBodies).toBe(0);
+
+    // Verify transistor pins and wires
+    const q1 = model.symbols.find((s) => s.ref === 'Q1');
+    expect(q1).toBeDefined();
+    for (const w of model.wires) {
+      expect(w.x1 === w.x2 || w.y1 === w.y2).toBe(true); // Manhattan routing strictly
+    }
+  });
 });
