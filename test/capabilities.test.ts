@@ -1,7 +1,7 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { mkdtemp, readdir, rm, writeFile, chmod, readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -29,6 +29,8 @@ import {
   resetKicadCliCache,
   execBoundedProcess,
   killProcessTree,
+  resolveTaskkillBinary,
+  type ProcessTreeKillOps,
   kicadCliVersion,
 } from '../src/kicad/cli.js';
 
@@ -529,22 +531,198 @@ describe('subprocess adapter and probe deadline enforcement', () => {
     expect(String(res.stdout).trim()).toMatch(/^v\d+/);
   });
 
-  it('safely handles undefined or 0 pid in killProcessTree as a no-op', () => {
-    expect(() => killProcessTree(undefined)).not.toThrow();
-    expect(() => killProcessTree(0)).not.toThrow();
+  describe('resolveTaskkillBinary', () => {
+    it('resolves taskkill.exe path using SystemRoot when defined', () => {
+      expect(resolveTaskkillBinary({ SystemRoot: 'C:\\Windows' })).toBe(
+        'C:\\Windows\\System32\\taskkill.exe',
+      );
+    });
+
+    it('falls back to windir when SystemRoot is unset or empty', () => {
+      expect(resolveTaskkillBinary({ windir: 'D:\\WinNT' })).toBe(
+        'D:\\WinNT\\System32\\taskkill.exe',
+      );
+      expect(resolveTaskkillBinary({ SystemRoot: '', windir: 'C:\\Windows' })).toBe(
+        'C:\\Windows\\System32\\taskkill.exe',
+      );
+      expect(resolveTaskkillBinary({ SystemRoot: '   ', windir: 'C:\\Windows' })).toBe(
+        'C:\\Windows\\System32\\taskkill.exe',
+      );
+    });
+
+    it('falls back to bare taskkill command when both SystemRoot and windir are missing or empty', () => {
+      expect(resolveTaskkillBinary({})).toBe('taskkill');
+      expect(resolveTaskkillBinary({ SystemRoot: '', windir: '' })).toBe('taskkill');
+      expect(resolveTaskkillBinary({ SystemRoot: '  ', windir: '  ' })).toBe('taskkill');
+    });
   });
 
-  it('falls back to bare taskkill command when SystemRoot and windir are unset on Windows', () => {
+  describe('killProcessTree execution on Windows', () => {
+    it('invokes taskkill with /F /T /PID and the resolved executable for the target process', () => {
+      const execSpy = vi.fn();
+      killProcessTree(12345, false, {
+        platform: 'win32',
+        env: { SystemRoot: 'C:\\Windows' },
+        execFileSync: execSpy,
+      });
+
+      expect(execSpy).toHaveBeenCalledTimes(1);
+      expect(execSpy).toHaveBeenCalledWith(
+        'C:\\Windows\\System32\\taskkill.exe',
+        ['/F', '/T', '/PID', '12345'],
+        { stdio: 'ignore', windowsHide: true, timeout: 2000 },
+      );
+    });
+
+    it('passes bare taskkill when environment variables are unset', () => {
+      const execSpy = vi.fn();
+      killProcessTree(12345, false, {
+        platform: 'win32',
+        env: {},
+        execFileSync: execSpy,
+      });
+
+      expect(execSpy).toHaveBeenCalledTimes(1);
+      expect(execSpy).toHaveBeenCalledWith(
+        'taskkill',
+        ['/F', '/T', '/PID', '12345'],
+        { stdio: 'ignore', windowsHide: true, timeout: 2000 },
+      );
+    });
+
+    it('catches and suppresses errors from execFileSync without throwing', () => {
+      const execSpy = vi.fn(() => {
+        throw new Error('Command failed: taskkill');
+      });
+      expect(() =>
+        killProcessTree(12345, false, {
+          platform: 'win32',
+          execFileSync: execSpy,
+        }),
+      ).not.toThrow();
+      expect(execSpy).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it('safely handles undefined or 0 pid in killProcessTree without issuing process operations', () => {
+    const winExecSpy = vi.fn();
+    killProcessTree(undefined, false, { platform: 'win32', execFileSync: winExecSpy });
+    killProcessTree(0, false, { platform: 'win32', execFileSync: winExecSpy });
+    expect(winExecSpy).not.toHaveBeenCalled();
+
+    const posixKillSpy = vi.fn();
+    killProcessTree(undefined, true, { platform: 'linux', kill: posixKillSpy });
+    killProcessTree(0, true, { platform: 'linux', kill: posixKillSpy });
+    killProcessTree(undefined, false, { platform: 'linux', kill: posixKillSpy });
+    killProcessTree(0, false, { platform: 'linux', kill: posixKillSpy });
+    expect(posixKillSpy).not.toHaveBeenCalled();
+  });
+
+  describe('killProcessTree execution on POSIX', () => {
+    it('attempts negative-PID SIGKILL for process group and does not invoke fallback on success', () => {
+      const killSpy = vi.fn();
+      killProcessTree(4242, true, { platform: 'linux', kill: killSpy });
+
+      expect(killSpy).toHaveBeenCalledTimes(1);
+      expect(killSpy).toHaveBeenCalledWith(-4242, 'SIGKILL');
+    });
+
+    it('falls back to positive-PID SIGKILL when process group termination fails', () => {
+      const killSpy = vi.fn((pid: number) => {
+        if (pid < 0) {
+          throw new Error('ESRCH: no such process group');
+        }
+      });
+      killProcessTree(4242, true, { platform: 'linux', kill: killSpy });
+
+      expect(killSpy).toHaveBeenCalledTimes(2);
+      expect(killSpy).toHaveBeenNthCalledWith(1, -4242, 'SIGKILL');
+      expect(killSpy).toHaveBeenNthCalledWith(2, 4242, 'SIGKILL');
+    });
+
+    it('invokes direct positive-PID SIGKILL when processGroup is false', () => {
+      const killSpy = vi.fn();
+      killProcessTree(4242, false, { platform: 'linux', kill: killSpy });
+
+      expect(killSpy).toHaveBeenCalledTimes(1);
+      expect(killSpy).toHaveBeenCalledWith(4242, 'SIGKILL');
+    });
+
+    it('catches and suppresses ESRCH errors when process has already exited on POSIX', () => {
+      const killSpy = vi.fn(() => {
+        throw new Error('ESRCH: no such process');
+      });
+      expect(() =>
+        killProcessTree(4242, false, { platform: 'linux', kill: killSpy }),
+      ).not.toThrow();
+      expect(killSpy).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it('terminates an owned child process on Windows using killProcessTree', async () => {
     if (!IS_WINDOWS) return;
-    const savedRoot = process.env.SystemRoot;
-    const savedWindir = process.env.windir;
+
+    const child = spawn(
+      process.execPath,
+      ['-e', 'console.log("READY"); setInterval(() => {}, 1000);'],
+      {
+        stdio: ['ignore', 'pipe', 'ignore'],
+        windowsHide: true,
+      },
+    );
+
     try {
-      delete process.env.SystemRoot;
-      delete process.env.windir;
-      expect(() => killProcessTree(999999)).not.toThrow();
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(
+          () => reject(new Error('Timed out waiting for test child process to be ready')),
+          5000,
+        );
+        child.stdout?.once('data', (chunk) => {
+          if (chunk.toString().includes('READY')) {
+            clearTimeout(timer);
+            resolve();
+          }
+        });
+        child.once('error', (err) => {
+          clearTimeout(timer);
+          reject(err);
+        });
+      });
+
+      const targetPid = child.pid;
+      expect(targetPid).toBeDefined();
+      expect(typeof targetPid).toBe('number');
+      expect(targetPid).toBeGreaterThan(0);
+
+      const exitPromise = new Promise<{ code: number | null; signal: string | null }>((resolve) => {
+        child.once('exit', (code, signal) => resolve({ code, signal }));
+      });
+
+      killProcessTree(targetPid);
+
+      const exitResult = await Promise.race([
+        exitPromise,
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('Child process did not exit within 3500ms bound')), 3500),
+        ),
+      ]);
+
+      expect(exitResult).toBeDefined();
     } finally {
-      if (savedRoot !== undefined) process.env.SystemRoot = savedRoot;
-      if (savedWindir !== undefined) process.env.windir = savedWindir;
+      try {
+        if (child.exitCode === null && !child.killed && child.pid) {
+          try {
+            execFileSync('taskkill', ['/F', '/T', '/PID', String(child.pid)], {
+              stdio: 'ignore',
+              windowsHide: true,
+            });
+          } catch {}
+          child.kill('SIGKILL');
+        }
+      } finally {
+        child.stdout?.destroy();
+        child.removeAllListeners();
+      }
     }
   });
 

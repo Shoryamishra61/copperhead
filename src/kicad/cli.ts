@@ -211,20 +211,57 @@ function fallbackAfterMissing(): string {
 }
 
 /**
+ * Options for internal process-killing operations in killProcessTree.
+ * Allows deterministic unit testing of decision branches and executable selection
+ * across platforms without mutating global state or targeting real host processes.
+ */
+export interface ProcessTreeKillOps {
+  platform?: NodeJS.Platform;
+  env?: NodeJS.ProcessEnv;
+  execFileSync?: (
+    file: string,
+    args: string[],
+    options: { stdio: 'ignore'; windowsHide: boolean; timeout: number },
+  ) => void;
+  kill?: (pid: number, signal?: string | number) => void;
+}
+
+/**
+ * Resolve the taskkill executable path on Windows using SystemRoot or windir,
+ * falling back to bare 'taskkill' when both are unset or empty.
+ */
+export function resolveTaskkillBinary(env: NodeJS.ProcessEnv = process.env): string {
+  const rawRoot = env.SystemRoot ?? env.systemroot;
+  const rawWin = env.windir ?? env.WINDIR;
+  const systemRoot =
+    rawRoot && rawRoot.trim() !== ''
+      ? rawRoot
+      : rawWin && rawWin.trim() !== ''
+        ? rawWin
+        : undefined;
+  return systemRoot
+    ? path.win32.join(systemRoot, 'System32', 'taskkill.exe')
+    : 'taskkill';
+}
+
+/**
  * Safely terminate a spawned process tree.
  * On Windows, taskkill is scoped to the specified process ID and its descendants.
  * On POSIX, the caller must have spawned the child as a process-group leader so
  * the negative PID reaches every descendant.
  */
-export function killProcessTree(pid: number | undefined, processGroup = false): void {
+export function killProcessTree(
+  pid: number | undefined,
+  processGroup = false,
+  ops?: ProcessTreeKillOps,
+): void {
   if (!pid) return;
-  if (process.platform === 'win32') {
+  const currentPlatform = ops?.platform ?? process.platform;
+  if (currentPlatform === 'win32') {
     try {
-      const systemRoot = process.env.SystemRoot ?? process.env.windir;
-      const taskkillBin = systemRoot
-        ? path.join(systemRoot, 'System32', 'taskkill.exe')
-        : 'taskkill';
-      execFileSync(taskkillBin, ['/F', '/T', '/PID', String(pid)], {
+      const taskkillBin = resolveTaskkillBinary(ops?.env ?? process.env);
+      const runExec = ops?.execFileSync ?? execFileSync;
+      runExec(taskkillBin, ['/F', '/T', '/PID', String(pid)], {
         stdio: 'ignore',
         windowsHide: true,
         timeout: 2000,
@@ -235,16 +272,17 @@ export function killProcessTree(pid: number | undefined, processGroup = false): 
     return;
   }
 
+  const runKill = ops?.kill ?? process.kill;
   if (processGroup) {
     try {
-      process.kill(-pid, 'SIGKILL');
+      runKill(-pid, 'SIGKILL');
       return;
     } catch {
       // The child may not be a group leader, or every group member has exited
     }
   }
   try {
-    process.kill(pid, 'SIGKILL');
+    runKill(pid, 'SIGKILL');
   } catch {
     // Process may have already exited
   }
