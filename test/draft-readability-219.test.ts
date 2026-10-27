@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { execa } from 'execa';
 import { SymbolSource } from '../src/kicad/draft/symsource.js';
 import { validateIntent, type SchematicIntent } from '../src/kicad/draft/ir.js';
-import { draftSchematicPlacement, type PlacementModel, type SchematicDraftReport } from '../src/kicad/draft/engine.js';
+import { draftSchematicPlacement, isLabelAnchorClear, type PlacementModel, type SchematicDraftReport } from '../src/kicad/draft/engine.js';
 import { emitSchematic } from '../src/kicad/emit.js';
 import { parseNetlist, netPartition } from './support/netlist.js';
 import type { Bounds } from '../src/kicad/sexp.js';
@@ -284,6 +284,28 @@ function makeDirectFixtureLib(): string {
 				(number "1" (effects (font (size 1.27 1.27))))
 			)
 			(pin passive line (at 0 2.54 270) (length 0.01)
+				(name "2" (effects (font (size 1.27 1.27))))
+				(number "2" (effects (font (size 1.27 1.27))))
+			)
+		)
+	)
+	(symbol "InwardTiedPins"
+		(pin_numbers hide)
+		(pin_names (offset 0))
+		(property "Reference" "U" (at 0 0 0) (effects (font (size 1.27 1.27))))
+		(property "Value" "InwardTiedPins" (at 0 0 0) (effects (font (size 1.27 1.27))))
+		(symbol "InwardTiedPins_0_1"
+			(rectangle (start -2.54 -1.27) (end 2.54 3.81)
+				(stroke (width 0.254) (type default))
+				(fill (type none))
+			)
+		)
+		(symbol "InwardTiedPins_1_1"
+			(pin passive line (at 0 2.54 90) (length 0.01)
+				(name "1" (effects (font (size 1.27 1.27))))
+				(number "1" (effects (font (size 1.27 1.27))))
+			)
+			(pin passive line (at 0 0 90) (length 0.01)
 				(name "2" (effects (font (size 1.27 1.27))))
 				(number "2" (effects (font (size 1.27 1.27))))
 			)
@@ -732,14 +754,20 @@ describe('schematic readability & wiring quality (#219)', () => {
       // Inward wire check:
       // A segment terminating at a pin must approach from the pin's outward direction (into free space).
       // A candidate segment heading inward into the symbol body is rejected by outwardDot < -0.01.
-      // InwardPassThrough has body [-2.54, 2.54] x [-2.54, 2.54], with Pin 1 at (0, -2.54) facing UP
-      // and Pin 2 at (0, 2.54) facing DOWN. A direct connection between Pin 1 and Pin 2 penetrates the
-      // actual transformed body interior. Because the candidate touches Pin 1, touchesOwnedPin is set,
-      // which bypasses segCrossesBody; outwardDot < -0.01 is the sole guard refusing this penetration.
+      // In InwardTiedPins, Pin 1 is at symbol (0, 2.54) and Pin 2 is at symbol (0, 0), both facing
+      // downward in schematic coordinates (outward dy = +1). The candidate route from Pin 1 directly
+      // reaches Pin 2 coincidentally with Pin 2's connection point (setting touchesOwnedPin = true),
+      // but enters Pin 2 from the inward direction (vy = -2.54, outwardDot = -2.54 < -0.01) through
+      // the symbol body.
+      // Under production code (outwardDot < -0.01), this inward route is refused, and the engine
+      // falls back to two separate stubs with global flags (localLabels.length === 0, globalLabels.length === 2).
+      // If the outwardDot guard is disabled (e.g. outwardDot < -1e9), the inward candidate is admitted,
+      // producing a single wired interconnect that penetrates the body interior and emits a local label.
       const intent: SchematicIntent = {
         version: 1,
         parts: [
-          { ref: 'U_INWARD', libId: 'DirectFixture:InwardPassThrough', value: 'PASS', group: 'MAIN' },
+          { ref: 'U0', libId: 'CopperMCU:MCU8', value: 'MCU', group: 'MAIN' },
+          { ref: 'U_INWARD', libId: 'DirectFixture:InwardTiedPins', value: 'TIED', group: 'MAIN' },
         ],
         nets: [
           { name: 'SHORT_NET', pins: ['U_INWARD.1', 'U_INWARD.2'] },
@@ -753,39 +781,27 @@ describe('schematic readability & wiring quality (#219)', () => {
         const u = model.symbols.find((s) => s.ref === 'U_INWARD')!;
         expect(u).toBeDefined();
 
-        // Exact transformed body bounds of U_INWARD matching its symbol definition [-2.54, 2.54]
-        const actualBody: Bounds = {
-          minX: u.at.x - 2.54,
-          maxX: u.at.x + 2.54,
-          minY: u.at.y - 2.54,
-          maxY: u.at.y + 2.54,
-        };
+        // Exact transformed body bounds of U_INWARD matching its symbol definition [-2.54, 2.54] x [-1.27, 3.81]
+        // Under production code, the inward route entering Pin 2 is refused by outwardDot < -0.01.
+        // As a result, the router refuses to wire the pins together through the body and falls back
+        // to two independent stubs with global net flags (0 local labels, 2 global flags).
+        // If the guard is disabled (outwardDot < -1e9), the inward route is admitted, wiring the
+        // pins together into a single cluster with 1 local label and 0 global labels.
+        const netLabels = model.labels.filter((l) => l.name === 'SHORT_NET');
+        const localLabels = netLabels.filter((l) => l.kind === 'local');
+        const globalLabels = netLabels.filter((l) => l.kind === 'global');
+        expect(localLabels).toHaveLength(0);
+        expect(globalLabels).toHaveLength(2);
 
-        // All emitted wires for SHORT_NET strictly clear U_INWARD's body interior
-        for (const w of model.wires) {
-          expect(
-            segCrossesBoxInterior(w.x1, w.y1, w.x2, w.y2, actualBody),
-            `Wire (${w.x1}, ${w.y1}) -> (${w.x2}, ${w.y2}) must not penetrate body`,
-          ).toBe(false);
-        }
-
-        // Geometric proof: the direct segment between Pin 1 (at -2.54) and Pin 2 (at +2.54)
-        // genuinely penetrates the body interior and has negative outward dot product
-        const pin1 = { x: u.at.x, y: u.at.y - 2.54, out: { dx: 0, dy: -1 } };
-        const pin2 = { x: u.at.x, y: u.at.y + 2.54, out: { dx: 0, dy: 1 } };
-        expect(segCrossesBoxInterior(pin1.x, pin1.y, pin2.x, pin2.y, actualBody)).toBe(true);
-
-        // Vector leaving pin1 toward pin2 is (0, 5.08); outward is (0, -1)
-        const vx1 = pin2.x - pin1.x;
-        const vy1 = pin2.y - pin1.y;
-        const outwardDot1 = vx1 * pin1.out.dx + vy1 * pin1.out.dy;
-        expect(outwardDot1).toBeLessThan(-0.01);
-
-        // Vector leaving pin2 toward pin1 is (0, -5.08); outward is (0, 1)
-        const vx2 = pin1.x - pin2.x;
-        const vy2 = pin1.y - pin2.y;
-        const outwardDot2 = vx2 * pin2.out.dx + vy2 * pin2.out.dy;
-        expect(outwardDot2).toBeLessThan(-0.01);
+        // Round-trip netlist verification via kicad-cli confirms SHORT_NET pins remain electrically connected
+        const schText = emitSchematic(model);
+        const schPath = path.join(workDir, 'board.kicad_sch');
+        await writeFile(schPath, schText, 'utf8');
+        const netPath = path.join(workDir, 'board.net');
+        await execa('kicad-cli', ['sch', 'export', 'netlist', '--output', netPath, schPath]);
+        const backNl = parseNetlist(await readFile(netPath, 'utf8'));
+        const parts = netPartition(backNl);
+        expect(parts.has('U_INWARD.1|U_INWARD.2') || parts.has('U_INWARD.2|U_INWARD.1')).toBe(true);
       } finally {
         await rm(workDir, { recursive: true, force: true });
       }
@@ -977,6 +993,7 @@ describe('schematic readability & wiring quality (#219)', () => {
         expect(netLabels[0]!.kind).toBe('local');
         // No unnecessary global flags representing routing fallback
         const globalLabels = netLabels.filter((l) => l.kind === 'global');
+        expect(globalLabels).toHaveLength(0);
         // Netlist round-trip verification via kicad-cli oracle confirms single partition
         const schText = emitSchematic(model);
         const schPath = path.join(workDir, 'board.kicad_sch');
@@ -1057,9 +1074,50 @@ describe('schematic readability & wiring quality (#219)', () => {
           const hasSw = part.includes('U1.8') || part.includes('C4.2');
           expect(hasBoot && hasSw, 'BOOT and SW must not be merged into the same partition').toBe(false);
         }
+
+        // 7. Verify production predicate isLabelAnchorClear on actual reference-board geometry:
+        // Demonstrates that clearOfBodies directly refuses foreign wire crossings.
+        // Negative control: point (crossX, crossY) on foreign wire SW must be rejected for net BOOT.
+        const atCrossClear = isLabelAnchorClear({ x: crossX, y: crossY }, 0, 'BOOT', model.wires, [], [], []);
+        expect(atCrossClear).toBe(false);
+
+        // Positive control: point on same BOOT wire with only BOOT wires must be accepted.
+        const bootWires = model.wires.filter((w) => w.net === 'BOOT');
+        expect(isLabelAnchorClear({ x: crossX, y: crossY }, 0, 'BOOT', bootWires, [], [], [])).toBe(true);
+
+        // Positive control: candidate off the crossing (e.g. crossX - 2.54) must be accepted.
+        const offCrossX = crossX - 2.54;
+        expect(isLabelAnchorClear({ x: offCrossX, y: crossY }, 0, 'BOOT', model.wires, [], [], [])).toBe(true);
       } finally {
         await rm(workDir, { recursive: true, force: true });
       }
+    });
+
+    it('isLabelAnchorClear independently protects against foreign pending stubs and committed wires', () => {
+      const netName = 'NET_A';
+      const foreignNet = 'NET_B';
+      const pt = { x: 50.8, y: 25.4 };
+
+      // 1. Foreign pending stub protection (negative control):
+      // A pending stub of a foreign net crossing pt must cause isLabelAnchorClear to return false.
+      const foreignStub = [{ x1: 50.8, y1: 20.32, x2: 50.8, y2: 30.48, net: foreignNet }];
+      expect(isLabelAnchorClear(pt, 0, netName, [], foreignStub, [], [])).toBe(false);
+
+      // Positive control: Same-net pending stub crossing pt must not be blocked.
+      const ownStub = [{ x1: 50.8, y1: 20.32, x2: 50.8, y2: 30.48, net: netName }];
+      expect(isLabelAnchorClear(pt, 0, netName, [], ownStub, [], [])).toBe(true);
+
+      // Positive control: When no pending stubs exist, pt is clear.
+      expect(isLabelAnchorClear(pt, 0, netName, [], [], [], [])).toBe(true);
+
+      // 2. Foreign committed wire protection (negative control):
+      // A committed wire of a foreign net crossing pt must cause isLabelAnchorClear to return false.
+      const foreignWire = [{ x1: 50.8, y1: 20.32, x2: 50.8, y2: 30.48, net: foreignNet }];
+      expect(isLabelAnchorClear(pt, 0, netName, foreignWire, [], [], [])).toBe(false);
+
+      // Positive control: Same-net committed wire crossing pt must not be blocked.
+      const ownWire = [{ x1: 50.8, y1: 20.32, x2: 50.8, y2: 30.48, net: netName }];
+      expect(isLabelAnchorClear(pt, 0, netName, ownWire, [], [], [])).toBe(true);
     });
   });
 });

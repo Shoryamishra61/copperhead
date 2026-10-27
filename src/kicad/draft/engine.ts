@@ -936,6 +936,29 @@ const segContains = (w: { x1: number; y1: number; x2: number; y2: number }, x: n
   (Math.abs(w.x1 - w.x2) < 0.01 ? Math.abs(x - w.x1) <= 0.01 : Math.abs(y - w.y1) <= 0.01);
 
 /**
+ * Test whether candidate point `pt` (and label text at `rot`) is clear to serve
+ * as a wired net's label anchor. The anchor must not lie on a foreign wire or
+ * pending foreign stub (which would electrically merge nets in KiCad), and the
+ * text box must not overlap component bodies/leads or neighbouring labels.
+ */
+export function isLabelAnchorClear(
+  pt: { x: number; y: number },
+  rot: number,
+  netName: string,
+  wires: readonly { x1: number; y1: number; x2: number; y2: number; net: string }[],
+  pendingStubs: readonly { x1: number; y1: number; x2: number; y2: number; net: string }[],
+  obstacleBodies: readonly Bounds[],
+  placedLabels: readonly { name: string; x: number; y: number; rot: number }[],
+  pad = TEXT_PAD,
+): boolean {
+  if (wires.some((w) => w.net !== netName && segContains(w, pt.x, pt.y))) return false;
+  if (pendingStubs.some((st) => st.net !== netName && segContains(st, pt.x, pt.y))) return false;
+  const b = labelTextBox(netName, pt.x, pt.y, rot);
+  if (obstacleBodies.some((body) => boundsOverlap(b, body))) return false;
+  return !placedLabels.some((o) => o.name !== netName && boundsOverlap(padBox(b, pad), labelTextBox(o.name, o.x, o.y, o.rot)));
+}
+
+/**
  * Draft, then check the drawn group boxes against one another: a box grows
  * past its tiling estimate when the text it must hold (a flag on a hung
  * part, a rail name at the edge) reaches further than the pin labels the
@@ -4858,7 +4881,7 @@ function draftOnce(
                 const vy = at1 ? c.y2 - c.y1 : c.y1 - c.y2;
                 // A segment terminating at a pin must approach from the pin's
                 // legal outward direction into free space. A wire heading inward
-                // into the symbol body or running along the body edge is refused.
+                // into the symbol body is refused; perpendicular arrivals are allowed.
                 const outwardDot = vx * p.out.dx + vy * p.out.dy;
                 if (outwardDot < -0.01) return false;
               }
@@ -5099,13 +5122,16 @@ function draftOnce(
           maxY: Math.max(pl.body.maxY, ...pts.map((q) => q.y)),
         };
       };
-      const clearOfBodies = (pt: { x: number; y: number }, rot = 0): boolean => {
-        if (wires.some((w) => w.net !== net.name && segContains(w, pt.x, pt.y))) return false;
-        if (pendingStubs.some((st) => st.net !== net.name && segContains(st, pt.x, pt.y))) return false;
-        const b = labelTextBox(net.name, pt.x, pt.y, rot);
-        if ([...placed.values()].some((pl) => boundsOverlap(b, withLeads(pl)))) return false;
-        return !labels.some((o) => o.name !== net.name && boundsOverlap(padBox(b), labelTextBox(o.name, o.x, o.y, o.rot)));
-      };
+      const clearOfBodies = (pt: { x: number; y: number }, rot = 0): boolean =>
+        isLabelAnchorClear(
+          pt,
+          rot,
+          net.name,
+          wires,
+          pendingStubs,
+          [...placed.values()].map(withLeads),
+          labels,
+        );
       const at0 = candidates.find((p) => clearOfBodies(p, 0));
       const at180 = !at0 ? candidates.find((p) => clearOfBodies(p, 180)) : undefined;
       const at = at0 ? { ...at0, rot: 0 } : at180 ? { ...at180, rot: 180 } : undefined;
@@ -5649,7 +5675,6 @@ function draftOnce(
     Math.max(w.x1, w.x2) > b.minX + 0.01 &&
     Math.min(w.y1, w.y2) < b.maxY - 0.01 &&
     Math.max(w.y1, w.y2) > b.minY + 0.01;
-
 
   // Wired-net labels first: the single label naming a wired run used to be
   // pinned at the topmost-leftmost wire point with no clearance check, and on
