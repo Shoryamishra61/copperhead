@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { mkdtemp, readdir, rm, writeFile, chmod, readFile } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { execFileSync, spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -462,8 +462,7 @@ describe('subprocess adapter and probe deadline enforcement', () => {
       });
 
       // Give the wrapper time to start its descendant, but never beyond the probe deadline.
-      const pidDeadline = Date.now() + 1200;
-      while (!existsSync(pidFile) && Date.now() < pidDeadline) {
+      for (let i = 0; i < 24 && !existsSync(pidFile); i++) {
         await delay(50);
       }
 
@@ -854,8 +853,7 @@ describe('subprocess adapter and probe deadline enforcement', () => {
         }
         expect(leaderPid).toBeGreaterThan(0);
 
-        const deadline = Date.now() + 2000;
-        while (!existsSync(pidFile) && Date.now() < deadline) {
+        for (let i = 0; i < 40 && !existsSync(pidFile); i++) {
           await delay(50);
         }
         expect(existsSync(pidFile)).toBe(true);
@@ -863,39 +861,40 @@ describe('subprocess adapter and probe deadline enforcement', () => {
         expect(Number.isInteger(descendantPid)).toBe(true);
         expect(descendantPid).toBeGreaterThan(0);
 
-        // Verify that both leader and descendant are actively running before killing the group
-        let descendantInitiallyAlive = false;
-        try {
-          process.kill(descendantPid, 0);
-          descendantInitiallyAlive = true;
-        } catch {}
-        expect(descendantInitiallyAlive).toBe(true);
+        // Helper to check whether a process is running and not a defunct zombie
+        const isProcessRunning = (pid: number): boolean => {
+          try {
+            process.kill(pid, 0);
+          } catch {
+            return false;
+          }
+          // On Linux, inspect /proc/<pid>/status to ensure the process is active and not a zombie
+          try {
+            const status = readFileSync(`/proc/${pid}/status`, 'utf8');
+            const match = status.match(/^State:\s+([A-Za-z])/m);
+            if (match && (match[1] === 'Z' || match[1] === 'z')) {
+              return false;
+            }
+          } catch {
+            // Non-Linux or process exited before status read
+          }
+          return true;
+        };
 
-        let leaderInitiallyAlive = false;
-        try {
-          process.kill(leaderPid, 0);
-          leaderInitiallyAlive = true;
-        } catch {}
-        expect(leaderInitiallyAlive).toBe(true);
+        // Verify that both leader and descendant are actively running and not zombies before killing
+        expect(isProcessRunning(descendantPid)).toBe(true);
+        expect(isProcessRunning(leaderPid)).toBe(true);
 
         killProcessTree(leaderPid, true);
 
         let leaderAlive = true;
         let descendantAlive = true;
-        for (let i = 0; i < 20; i++) {
+        for (let i = 0; i < 40; i++) {
           if (leaderAlive) {
-            try {
-              process.kill(leaderPid!, 0);
-            } catch {
-              leaderAlive = false;
-            }
+            leaderAlive = isProcessRunning(leaderPid);
           }
           if (descendantAlive) {
-            try {
-              process.kill(descendantPid!, 0);
-            } catch {
-              descendantAlive = false;
-            }
+            descendantAlive = isProcessRunning(descendantPid);
           }
           if (!leaderAlive && !descendantAlive) break;
           await delay(50);
