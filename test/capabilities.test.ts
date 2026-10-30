@@ -849,7 +849,9 @@ describe('subprocess adapter and probe deadline enforcement', () => {
       let descendantPid: number | undefined;
       try {
         const leaderPid = child.pid;
-        expect(leaderPid).toBeDefined();
+        if (!leaderPid) {
+          expect.fail('child.pid was not assigned');
+        }
         expect(leaderPid).toBeGreaterThan(0);
 
         const deadline = Date.now() + 2000;
@@ -860,6 +862,21 @@ describe('subprocess adapter and probe deadline enforcement', () => {
         descendantPid = Number((await readFile(pidFile, 'utf8')).trim());
         expect(Number.isInteger(descendantPid)).toBe(true);
         expect(descendantPid).toBeGreaterThan(0);
+
+        // Verify that both leader and descendant are actively running before killing the group
+        let descendantInitiallyAlive = false;
+        try {
+          process.kill(descendantPid, 0);
+          descendantInitiallyAlive = true;
+        } catch {}
+        expect(descendantInitiallyAlive).toBe(true);
+
+        let leaderInitiallyAlive = false;
+        try {
+          process.kill(leaderPid, 0);
+          leaderInitiallyAlive = true;
+        } catch {}
+        expect(leaderInitiallyAlive).toBe(true);
 
         killProcessTree(leaderPid, true);
 
@@ -1339,17 +1356,48 @@ describe('real CLI process execution (published build and source entry point)', 
 
     for (let i = cmdSectionIndex + 1; i < lines.length; i++) {
       const line = lines[i];
-      if (!line) continue;
-      // Match command definition line: indentation followed by command name (with optional aliases and arguments)
-      const match = line.match(
-        /^ {2}([a-z0-9_-]+)(?:\|[a-z0-9_-]+)?(?:\s+\[[^\]]+\]|\s+<[^>]+>)*\s{2,}/,
-      );
-      const cmdName = match?.[1];
-      if (cmdName && cmdName !== 'help') {
-        observedCommands.push(cmdName);
+      if (!line || line.trim() === '') continue;
+      // Description continuation lines are indented with 3 or more spaces
+      if (/^ {3,}\S/.test(line)) continue;
+      // Command definition lines must begin with exactly two spaces
+      if (/^ {2}\S/.test(line)) {
+        const match = line.match(
+          /^ {2}([a-z0-9_-]+)(?:\|[a-z0-9_-]+)?(?:\s+\[[^\]]+\]|\s+<[^>]+>)*\s{2,}/,
+        );
+        if (!match || !match[1]) {
+          expect.fail(`Failed to parse command definition line in help output: "${line}"`);
+        }
+        if (match[1] !== 'help') {
+          observedCommands.push(match[1]);
+        }
+        continue;
       }
+      // Any other non-empty line marks the end of the Commands section
+      break;
     }
     const expectedSorted = [...observedCommands].sort();
+
+    // Verify observed command set is complete and truthful
+    expect(observedCommands.length).toBe(15);
+    expect(observedCommands).toEqual(
+      expect.arrayContaining([
+        'capabilities',
+        'check',
+        'create',
+        'demo',
+        'do',
+        'doctor',
+        'draft',
+        'export',
+        'init',
+        'mcp',
+        'repl',
+        'review',
+        'score',
+        'skill',
+        'sync',
+      ]),
+    );
 
     // Verify capabilities --json descriptor matches the independently observed command set exactly
     const capRes = await execa(process.execPath, [DIST_CLI, 'capabilities', '--json'], {
@@ -1360,6 +1408,7 @@ describe('real CLI process execution (published build and source entry point)', 
     expect(capRes.exitCode).toBe(0);
 
     const parsed = JSON.parse(capRes.stdout) as CapabilityReport;
+    expect(parsed.commands.length).toBe(15);
     expect(parsed.commands).toEqual(expectedSorted);
   });
 
