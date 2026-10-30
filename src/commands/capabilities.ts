@@ -228,7 +228,7 @@ export function isProtocolCompatible(
   expectedMajor = SUPPORTED_PROTOCOL_MAJOR,
 ): boolean {
   if (!protocol || typeof protocol !== 'string') return false;
-  const match = protocol.match(/^copperhead-run\/([1-9]\d*)(?:\.(\d+))?$/);
+  const match = protocol.match(/^copperhead-run\/([1-9]\d*)(?:\.(0|[1-9]\d*))?$/);
   if (!match) return false;
   const major = Number(match[1]);
   return Number.isFinite(major) && major === expectedMajor;
@@ -239,14 +239,15 @@ export function isProtocolCompatible(
  * Throws an actionable error if the protocol major differs or report is malformed.
  */
 export function assertProtocolCompatible(
-  report: { protocol: string; [key: string]: unknown } | null | undefined,
+  report: unknown,
   expectedMajor = SUPPORTED_PROTOCOL_MAJOR,
 ): void {
-  if (!report || typeof report !== 'object' || typeof report.protocol !== 'string' || !isProtocolCompatible(report.protocol, expectedMajor)) {
-    const received =
-      report && typeof report === 'object' && 'protocol' in report && typeof report.protocol === 'string'
-        ? report.protocol
-        : String(report);
+  const protocol =
+    report && typeof report === 'object' && 'protocol' in report && typeof report.protocol === 'string'
+      ? report.protocol
+      : undefined;
+  if (!protocol || !isProtocolCompatible(protocol, expectedMajor)) {
+    const received = protocol ?? String(report);
     throw new Error(
       `Unsupported protocol version "${received}". Expected copperhead-run/${expectedMajor}.`,
     );

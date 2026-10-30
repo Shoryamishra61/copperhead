@@ -46,6 +46,8 @@ Issue #258 outlines the multi-phase run protocol roadmap. Phase 0 delivers the c
 - **D5: Isolated subprocess probes with timeout bounds and anchored version parsing.**
   Subprocess probes for `kicad-cli`, `git`, and `openspec` use explicit argument lists without shell interpolation and are bounded by a 5000 ms deadline (including `kicad-cli` via `kicadCliVersion({ timeout: 5000 })`). When a tool is not installed, times out, or errors, its entry in `tools` is `null`. Probe outputs are strictly validated against anchored version patterns; warning-only output, diagnostic text, stack traces, and local filesystem paths are rejected and never leaked into the JSON output.
 
+  *Known limitation (POSIX detached subprocess lifecycle)*: On POSIX platforms, bounded probes use `detached: true` to create a dedicated process group so that on deadline expiry `killProcessTree` terminates all descendant processes via negative-PID `SIGKILL`. However, detached process groups do not receive terminal signals (`SIGINT`, `SIGTERM`) delivered to the foreground parent group. If the CLI parent process is terminated by terminal interruption before the deadline fires, detached descendants may continue running until completion. Comprehensive process-tree signal forwarding across concurrent probes requires global lifecycle orchestration, which is delegated to Issue #251 (signal-based cancellation and runner lifecycle).
+
 - **D6: Dependency injection for test isolation.**
   `collectCapabilities` accepts injectable `CapabilityDeps`, allowing automated unit tests to verify missing-tool scenarios deterministically on any operating system without modifying system PATH.
 

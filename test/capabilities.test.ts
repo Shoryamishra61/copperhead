@@ -108,6 +108,8 @@ describe('protocol constant and version semantics', () => {
 
   it('strictly rejects malformed protocol strings, leading zeros, and invalid suffixes', () => {
     expect(isProtocolCompatible('copperhead-run/01')).toBe(false);
+    expect(isProtocolCompatible('copperhead-run/1.01')).toBe(false);
+    expect(isProtocolCompatible('copperhead-run/1.00')).toBe(false);
     expect(isProtocolCompatible('copperhead-run/1.anything')).toBe(false);
     expect(isProtocolCompatible('copperhead-run/2')).toBe(false);
     expect(isProtocolCompatible('copperhead-run/0')).toBe(false);
@@ -117,9 +119,11 @@ describe('protocol constant and version semantics', () => {
     expect(isProtocolCompatible('copperhead-run')).toBe(false);
     expect(isProtocolCompatible('copperhead-run/')).toBe(false);
     expect(isProtocolCompatible('copperhead-run/1.2.3')).toBe(false);
+    expect(isProtocolCompatible('copperhead-run/1 ')).toBe(false);
+    expect(isProtocolCompatible(' copperhead-run/1')).toBe(false);
   });
 
-  it('assertProtocolCompatible accepts valid report and rejects unknown major or invalid input', () => {
+  it('assertProtocolCompatible accepts valid report and rejects unknown major or invalid input', async () => {
     const validReport: CapabilityReport = {
       protocol: 'copperhead-run/1',
       cli: '0.12.0',
@@ -134,6 +138,20 @@ describe('protocol constant and version semantics', () => {
     };
 
     expect(() => assertProtocolCompatible(validReport, 1)).not.toThrow();
+
+    // Compile-time and runtime assignability probe for producer-consumer handshake
+    const collected: CapabilityReport = await collectCapabilities({
+      commands: ['check'],
+      deps: {
+        nodeVersion: 'v20.19.0',
+        cliVersion: '0.12.0',
+        kicadVersion: async () => '10.0.4',
+        gitVersion: async () => '2.43.0',
+        openspecVersion: async () => '1.14.1',
+      },
+    });
+    expect(() => assertProtocolCompatible(collected, 1)).not.toThrow();
+    expect(() => assertProtocolCompatible(collected)).not.toThrow();
 
     expect(() =>
       assertProtocolCompatible({ ...validReport, protocol: 'copperhead-run/2' }, 1),
@@ -150,12 +168,13 @@ describe('protocol constant and version semantics', () => {
     // Structural negative assertions against null, non-objects, and missing protocol field
     expect(() => assertProtocolCompatible(null, 1)).toThrow(/unsupported protocol version/i);
     expect(() => assertProtocolCompatible(undefined, 1)).toThrow(/unsupported protocol version/i);
-    expect(() => assertProtocolCompatible({} as unknown as CapabilityReport, 1)).toThrow(
+    expect(() => assertProtocolCompatible({}, 1)).toThrow(/unsupported protocol version/i);
+    expect(() => assertProtocolCompatible('not-a-report', 1)).toThrow(
       /unsupported protocol version/i,
     );
-    expect(() =>
-      assertProtocolCompatible('not-a-report' as unknown as CapabilityReport, 1),
-    ).toThrow(/unsupported protocol version/i);
+    expect(() => assertProtocolCompatible({ protocol: 123 }, 1)).toThrow(
+      /unsupported protocol version/i,
+    );
   });
 
   it('consumer compatibility ignores unknown added JSON fields (extensibility)', () => {
@@ -534,26 +553,75 @@ describe('subprocess adapter and probe deadline enforcement', () => {
   describe('resolveTaskkillBinary', () => {
     it('resolves taskkill.exe path using SystemRoot when defined', () => {
       expect(resolveTaskkillBinary({ SystemRoot: 'C:\\Windows' })).toBe(
-        'C:\\Windows\\System32\\taskkill.exe',
+        path.win32.join('C:\\Windows', 'System32', 'taskkill.exe'),
       );
     });
 
-    it('falls back to windir when SystemRoot is unset or empty', () => {
+    it('resolves lower-case systemroot when SystemRoot is unset', () => {
+      expect(resolveTaskkillBinary({ systemroot: 'D:\\WinSys' })).toBe(
+        path.win32.join('D:\\WinSys', 'System32', 'taskkill.exe'),
+      );
+    });
+
+    it('falls back to windir when SystemRoot and systemroot are unset or empty', () => {
       expect(resolveTaskkillBinary({ windir: 'D:\\WinNT' })).toBe(
-        'D:\\WinNT\\System32\\taskkill.exe',
+        path.win32.join('D:\\WinNT', 'System32', 'taskkill.exe'),
       );
       expect(resolveTaskkillBinary({ SystemRoot: '', windir: 'C:\\Windows' })).toBe(
-        'C:\\Windows\\System32\\taskkill.exe',
+        path.win32.join('C:\\Windows', 'System32', 'taskkill.exe'),
       );
       expect(resolveTaskkillBinary({ SystemRoot: '   ', windir: 'C:\\Windows' })).toBe(
-        'C:\\Windows\\System32\\taskkill.exe',
+        path.win32.join('C:\\Windows', 'System32', 'taskkill.exe'),
       );
     });
 
-    it('falls back to bare taskkill command when both SystemRoot and windir are missing or empty', () => {
+    it('resolves upper-case WINDIR when other candidates are unset or empty', () => {
+      expect(resolveTaskkillBinary({ WINDIR: 'E:\\LegacyWin' })).toBe(
+        path.win32.join('E:\\LegacyWin', 'System32', 'taskkill.exe'),
+      );
+      expect(
+        resolveTaskkillBinary({ SystemRoot: '', systemroot: '   ', windir: '', WINDIR: 'E:\\LegacyWin' }),
+      ).toBe(path.win32.join('E:\\LegacyWin', 'System32', 'taskkill.exe'));
+    });
+
+    it('enforces mixed-case environment variable precedence', () => {
+      expect(
+        resolveTaskkillBinary({
+          SystemRoot: 'C:\\RootPrimary',
+          systemroot: 'C:\\RootSecondary',
+          windir: 'C:\\WinDirLower',
+          WINDIR: 'C:\\WinDirUpper',
+        }),
+      ).toBe(path.win32.join('C:\\RootPrimary', 'System32', 'taskkill.exe'));
+
+      expect(
+        resolveTaskkillBinary({
+          systemroot: 'C:\\RootSecondary',
+          windir: 'C:\\WinDirLower',
+          WINDIR: 'C:\\WinDirUpper',
+        }),
+      ).toBe(path.win32.join('C:\\RootSecondary', 'System32', 'taskkill.exe'));
+
+      expect(
+        resolveTaskkillBinary({
+          windir: 'C:\\WinDirLower',
+          WINDIR: 'C:\\WinDirUpper',
+        }),
+      ).toBe(path.win32.join('C:\\WinDirLower', 'System32', 'taskkill.exe'));
+    });
+
+    it('falls back to bare taskkill command when all candidates are missing, empty, or whitespace', () => {
       expect(resolveTaskkillBinary({})).toBe('taskkill');
       expect(resolveTaskkillBinary({ SystemRoot: '', windir: '' })).toBe('taskkill');
       expect(resolveTaskkillBinary({ SystemRoot: '  ', windir: '  ' })).toBe('taskkill');
+      expect(
+        resolveTaskkillBinary({
+          SystemRoot: '',
+          systemroot: '   ',
+          windir: '\t',
+          WINDIR: ' ',
+        }),
+      ).toBe('taskkill');
     });
   });
 
@@ -659,72 +727,183 @@ describe('subprocess adapter and probe deadline enforcement', () => {
     });
   });
 
-  it('terminates an owned child process on Windows using killProcessTree', async () => {
-    if (!IS_WINDOWS) return;
+  it.runIf(IS_WINDOWS)(
+    'terminates an owned child process on Windows using killProcessTree',
+    async () => {
+      const child = spawn(
+        process.execPath,
+        ['-e', 'console.log("READY"); setInterval(() => {}, 1000);'],
+        {
+          stdio: ['ignore', 'pipe', 'ignore'],
+          windowsHide: true,
+        },
+      );
 
-    const child = spawn(
-      process.execPath,
-      ['-e', 'console.log("READY"); setInterval(() => {}, 1000);'],
-      {
-        stdio: ['ignore', 'pipe', 'ignore'],
-        windowsHide: true,
-      },
-    );
+      let readyTimer: NodeJS.Timeout | undefined;
+      let raceTimer: NodeJS.Timeout | undefined;
 
-    try {
-      await new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(
-          () => reject(new Error('Timed out waiting for test child process to be ready')),
-          5000,
-        );
-        child.stdout?.once('data', (chunk) => {
-          if (chunk.toString().includes('READY')) {
-            clearTimeout(timer);
-            resolve();
-          }
-        });
-        child.once('error', (err) => {
-          clearTimeout(timer);
-          reject(err);
-        });
-      });
-
-      const targetPid = child.pid;
-      expect(targetPid).toBeDefined();
-      expect(typeof targetPid).toBe('number');
-      expect(targetPid).toBeGreaterThan(0);
-
-      const exitPromise = new Promise<{ code: number | null; signal: string | null }>((resolve) => {
-        child.once('exit', (code, signal) => resolve({ code, signal }));
-      });
-
-      killProcessTree(targetPid);
-
-      const exitResult = await Promise.race([
-        exitPromise,
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error('Child process did not exit within 3500ms bound')), 3500),
-        ),
-      ]);
-
-      expect(exitResult).toBeDefined();
-    } finally {
       try {
-        if (child.exitCode === null && !child.killed && child.pid) {
-          try {
-            execFileSync('taskkill', ['/F', '/T', '/PID', String(child.pid)], {
-              stdio: 'ignore',
-              windowsHide: true,
-            });
-          } catch {}
-          child.kill('SIGKILL');
-        }
+        await new Promise<void>((resolve, reject) => {
+          const cleanupReady = () => {
+            if (readyTimer) {
+              clearTimeout(readyTimer);
+              readyTimer = undefined;
+            }
+            child.stdout?.removeListener('data', onData);
+            child.removeListener('error', onError);
+            child.removeListener('exit', onExit);
+          };
+          const onData = (chunk: Buffer | string) => {
+            if (chunk.toString().includes('READY')) {
+              cleanupReady();
+              resolve();
+            }
+          };
+          const onError = (err: Error) => {
+            cleanupReady();
+            reject(err);
+          };
+          const onExit = (code: number | null) => {
+            cleanupReady();
+            reject(new Error(`Test child exited prematurely with code ${code}`));
+          };
+          readyTimer = setTimeout(() => {
+            cleanupReady();
+            reject(new Error('Timed out waiting for test child process to be ready'));
+          }, 5000);
+          child.stdout?.once('data', onData);
+          child.once('error', onError);
+          child.once('exit', onExit);
+        });
+
+        const targetPid = child.pid;
+        expect(targetPid).toBeDefined();
+        expect(typeof targetPid).toBe('number');
+        expect(targetPid).toBeGreaterThan(0);
+        expect(child.exitCode).toBeNull();
+
+        const exitPromise = new Promise<{ code: number | null; signal: string | null }>((resolve) => {
+          child.once('exit', (code, signal) => resolve({ code, signal }));
+        });
+
+        killProcessTree(targetPid);
+
+        const exitResult = await Promise.race([
+          exitPromise,
+          new Promise<never>((_, reject) => {
+            raceTimer = setTimeout(
+              () => reject(new Error('Child process did not exit within 3500ms bound')),
+              3500,
+            );
+          }),
+        ]);
+
+        expect(exitResult).toBeDefined();
+        expect(child.exitCode !== null || child.killed).toBe(true);
       } finally {
-        child.stdout?.destroy();
-        child.removeAllListeners();
+        if (readyTimer) {
+          clearTimeout(readyTimer);
+          readyTimer = undefined;
+        }
+        if (raceTimer) {
+          clearTimeout(raceTimer);
+          raceTimer = undefined;
+        }
+        try {
+          if (child.exitCode === null && !child.killed && child.pid) {
+            try {
+              execFileSync('taskkill', ['/F', '/T', '/PID', String(child.pid)], {
+                stdio: 'ignore',
+                windowsHide: true,
+              });
+            } catch {}
+            child.kill('SIGKILL');
+          }
+        } finally {
+          child.stdout?.destroy();
+          child.removeAllListeners();
+        }
       }
-    }
-  });
+    },
+  );
+
+  it.runIf(!IS_WINDOWS)(
+    'terminates POSIX process group with negative PID when probe hangs',
+    async () => {
+      const scratchDir = await mkdtemp(path.join(tmpdir(), 'copperhead-posix-pgid-'));
+      const pidFile = path.join(scratchDir, 'child.pid');
+      const scriptFile = path.join(scratchDir, 'wrapper.sh');
+
+      await writeFile(
+        scriptFile,
+        `#!/bin/sh\nsh -c 'sleep 30' &\necho $! > "${pidFile}"\nwait\n`,
+        'utf8',
+      );
+      await chmod(scriptFile, 0o755);
+
+      const child = spawn(scriptFile, [], {
+        detached: true,
+        stdio: 'ignore',
+      });
+
+      let descendantPid: number | undefined;
+      try {
+        const leaderPid = child.pid;
+        expect(leaderPid).toBeDefined();
+        expect(leaderPid).toBeGreaterThan(0);
+
+        const deadline = Date.now() + 2000;
+        while (!existsSync(pidFile) && Date.now() < deadline) {
+          await delay(50);
+        }
+        expect(existsSync(pidFile)).toBe(true);
+        descendantPid = Number((await readFile(pidFile, 'utf8')).trim());
+        expect(Number.isInteger(descendantPid)).toBe(true);
+        expect(descendantPid).toBeGreaterThan(0);
+
+        killProcessTree(leaderPid, true);
+
+        let leaderAlive = true;
+        let descendantAlive = true;
+        for (let i = 0; i < 20; i++) {
+          if (leaderAlive) {
+            try {
+              process.kill(leaderPid!, 0);
+            } catch {
+              leaderAlive = false;
+            }
+          }
+          if (descendantAlive) {
+            try {
+              process.kill(descendantPid!, 0);
+            } catch {
+              descendantAlive = false;
+            }
+          }
+          if (!leaderAlive && !descendantAlive) break;
+          await delay(50);
+        }
+
+        expect(leaderAlive).toBe(false);
+        expect(descendantAlive).toBe(false);
+      } finally {
+        if (child.pid) {
+          try {
+            process.kill(-child.pid, 'SIGKILL');
+          } catch {}
+          try {
+            process.kill(child.pid, 'SIGKILL');
+          } catch {}
+        }
+        if (descendantPid) {
+          try {
+            process.kill(descendantPid, 'SIGKILL');
+          } catch {}
+        }
+        await rm(scratchDir, { recursive: true, force: true });
+      }
+    },
+  );
 
   it('throws explicit deadline exceeded error when kicadCliVersion times out', async () => {
     const scratchDir = await mkdtemp(path.join(tmpdir(), 'copperhead-kicad-timeout-'));
@@ -1160,12 +1339,14 @@ describe('real CLI process execution (published build and source entry point)', 
 
     for (let i = cmdSectionIndex + 1; i < lines.length; i++) {
       const line = lines[i];
+      if (!line) continue;
       // Match command definition line: indentation followed by command name (with optional aliases and arguments)
       const match = line.match(
         /^ {2}([a-z0-9_-]+)(?:\|[a-z0-9_-]+)?(?:\s+\[[^\]]+\]|\s+<[^>]+>)*\s{2,}/,
       );
-      if (match && match[1] !== 'help') {
-        observedCommands.push(match[1]);
+      const cmdName = match?.[1];
+      if (cmdName && cmdName !== 'help') {
+        observedCommands.push(cmdName);
       }
     }
     const expectedSorted = [...observedCommands].sort();

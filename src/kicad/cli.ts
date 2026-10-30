@@ -231,17 +231,13 @@ export interface ProcessTreeKillOps {
  * falling back to bare 'taskkill' when both are unset or empty.
  */
 export function resolveTaskkillBinary(env: NodeJS.ProcessEnv = process.env): string {
-  const rawRoot = env.SystemRoot ?? env.systemroot;
-  const rawWin = env.windir ?? env.WINDIR;
-  const systemRoot =
-    rawRoot && rawRoot.trim() !== ''
-      ? rawRoot
-      : rawWin && rawWin.trim() !== ''
-        ? rawWin
-        : undefined;
-  return systemRoot
-    ? path.win32.join(systemRoot, 'System32', 'taskkill.exe')
-    : 'taskkill';
+  const candidates = [env.SystemRoot, env.systemroot, env.windir, env.WINDIR];
+  for (const candidate of candidates) {
+    if (candidate && candidate.trim() !== '') {
+      return path.win32.join(candidate, 'System32', 'taskkill.exe');
+    }
+  }
+  return 'taskkill';
 }
 
 /**
