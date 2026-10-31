@@ -311,6 +311,60 @@ function makeDirectFixtureLib(): string {
 			)
 		)
 	)
+	(symbol "BodyExtend_Horiz"
+		(pin_numbers hide)
+		(pin_names (offset 0))
+		(property "Reference" "U" (at 0 0 0) (effects (font (size 1.27 1.27))))
+		(property "Value" "BodyExtend_Horiz" (at 0 0 0) (effects (font (size 1.27 1.27))))
+		(symbol "BodyExtend_Horiz_0_1"
+			(rectangle (start -1.27 -1.27) (end 5.08 1.27)
+				(stroke (width 0.254) (type default))
+				(fill (type none))
+			)
+		)
+		(symbol "BodyExtend_Horiz_1_1"
+			(pin passive line (at 2.54 0 180) (length 1.27)
+				(name "~" (effects (font (size 1.27 1.27))))
+				(number "1" (effects (font (size 1.27 1.27))))
+			)
+		)
+	)
+	(symbol "StubProbe_Down"
+		(pin_numbers hide)
+		(pin_names (offset 0))
+		(property "Reference" "U" (at 0 0 0) (effects (font (size 1.27 1.27))))
+		(property "Value" "StubProbe_Down" (at 0 0 0) (effects (font (size 1.27 1.27))))
+		(symbol "StubProbe_Down_0_1"
+			(rectangle (start -1.27 -1.27) (end 1.27 1.27)
+				(stroke (width 0.254) (type default))
+				(fill (type none))
+			)
+		)
+		(symbol "StubProbe_Down_1_1"
+			(pin passive line (at 2.54 -7.62 90) (length 1.27)
+				(name "~" (effects (font (size 1.27 1.27))))
+				(number "1" (effects (font (size 1.27 1.27))))
+			)
+		)
+	)
+	(symbol "FacingLeft_1Pin"
+		(pin_numbers hide)
+		(pin_names (offset 0))
+		(property "Reference" "U" (at 0 0 0) (effects (font (size 1.27 1.27))))
+		(property "Value" "FacingLeft_1Pin" (at 0 0 0) (effects (font (size 1.27 1.27))))
+		(symbol "FacingLeft_1Pin_0_1"
+			(rectangle (start -1.27 -1.27) (end 1.27 1.27)
+				(stroke (width 0.254) (type default))
+				(fill (type none))
+			)
+		)
+		(symbol "FacingLeft_1Pin_1_1"
+			(pin passive line (at -2.54 0 0) (length 1.27)
+				(name "~" (effects (font (size 1.27 1.27))))
+				(number "1" (effects (font (size 1.27 1.27))))
+			)
+		)
+	)
 )
 `;
 }
@@ -781,7 +835,6 @@ describe('schematic readability & wiring quality (#219)', () => {
         const u = model.symbols.find((s) => s.ref === 'U_INWARD')!;
         expect(u).toBeDefined();
 
-        // Exact transformed body bounds of U_INWARD matching its symbol definition [-2.54, 2.54] x [-1.27, 3.81]
         // Under production code, the inward route entering Pin 2 is refused by outwardDot < -0.01.
         // As a result, the router refuses to wire the pins together through the body and falls back
         // to two independent stubs with global net flags (0 local labels, 2 global flags).
@@ -1118,6 +1171,74 @@ describe('schematic readability & wiring quality (#219)', () => {
       // Positive control: Same-net committed wire crossing pt must not be blocked.
       const ownWire = [{ x1: 50.8, y1: 20.32, x2: 50.8, y2: 30.48, net: netName }];
       expect(isLabelAnchorClear(pt, 0, netName, ownWire, [], [], [])).toBe(true);
+    });
+
+    it('draftSchematicPlacement clearOfBodies call site rejects foreign pending stubs when selecting label position', async () => {
+      // Regression test for Finding 1:
+      // Verifies that clearOfBodies at engine.ts:5126 passes real wires and pendingStubs to isLabelAnchorClear.
+      // In this deterministic fixture, B_TARGET runs horizontally at y = 69.85 between U_B_LFT and U_B_RGT.
+      // U_B_LFT body extends to x = 97.79, so candidates at x = 95.25 and 96.52 are rejected by symbol bounds.
+      // The first candidate clearing the symbol body is x = 97.79.
+      // However, foreign net Z_FOREIGN drops a pending stub from pin U_A1.1 at (97.79, 66.04)
+      // extending downward to (97.79, 71.12), intersecting (97.79, 69.85).
+      //
+      // Under production code (wires, pendingStubs passed):
+      // clearOfBodies(97.79, 69.85) detects the foreign pending stub and returns false.
+      // The engine selects the next candidate at x = 99.06 (safe free space).
+      //
+      // Under mutation (wires and pendingStubs replaced by empty arrays []):
+      // clearOfBodies(97.79, 69.85) fails to check pending stubs, accepts x = 97.79,
+      // and places the B_TARGET label directly on Z_FOREIGN pending stub.
+      const intent: SchematicIntent = {
+        version: 1,
+        parts: [
+          { ref: 'U_A1', libId: 'DirectFixture:StubProbe_Down', value: 'A1', group: 'MAIN' },
+          { ref: 'U_A2', libId: 'DirectFixture:FacingLeft_1Pin', value: 'A2', group: 'MAIN' },
+          { ref: 'U_B_LFT', libId: 'DirectFixture:BodyExtend_Horiz', value: 'B_LFT', group: 'MAIN' },
+          { ref: 'U_B_RGT', libId: 'DirectFixture:FacingLeft_1Pin', value: 'B_RGT', group: 'MAIN' },
+        ],
+        nets: [
+          { name: 'B_TARGET', pins: ['U_B_LFT.1', 'U_B_RGT.1'] },
+          { name: 'Z_FOREIGN', pins: ['U_A1.1', 'U_A2.1'] },
+        ],
+      };
+
+      const { model, report, workDir } = await placeWithFixture(intent, makeDirectFixtureLib());
+      try {
+        expect(report.mergedNets).toEqual([]);
+
+        // Locate B_TARGET label
+        const bTargetLabel = model.labels.find((l) => l.name === 'B_TARGET');
+        expect(bTargetLabel).toBeDefined();
+
+        // Pin candidate coordinates: candidate at 97.79 is rejected due to foreign pending stub,
+        // advancing label placement to 99.06.
+        // Under the mutation where clearOfBodies passes [] for pendingStubs,
+        // bTargetLabel.x is 97.79 (directly colliding with Z_FOREIGN).
+        expect(bTargetLabel!.x).toBeCloseTo(99.06, 2);
+        expect(bTargetLabel!.y).toBeCloseTo(69.85, 2);
+        expect(Math.abs(bTargetLabel!.x - 97.79)).toBeGreaterThan(0.5);
+
+        // Independent oracle: netlist verification via kicad-cli confirms B_TARGET and Z_FOREIGN
+        // remain completely independent electrical partitions with no merged pins.
+        const schText = emitSchematic(model);
+        const schPath = path.join(workDir, 'board.kicad_sch');
+        await writeFile(schPath, schText, 'utf8');
+        const netPath = path.join(workDir, 'board.net');
+        await execa('kicad-cli', ['sch', 'export', 'netlist', '--output', netPath, schPath]);
+        const backNl = parseNetlist(await readFile(netPath, 'utf8'));
+        const parts = netPartition(backNl);
+
+        expect(parts.has('U_B_LFT.1|U_B_RGT.1')).toBe(true);
+        expect(parts.has('U_A1.1|U_A2.1')).toBe(true);
+        for (const part of parts) {
+          const hasB = part.includes('U_B_LFT.1') || part.includes('U_B_RGT.1');
+          const hasZ = part.includes('U_A1.1') || part.includes('U_A2.1');
+          expect(hasB && hasZ, 'B_TARGET and Z_FOREIGN must not be merged').toBe(false);
+        }
+      } finally {
+        await rm(workDir, { recursive: true, force: true });
+      }
     });
   });
 });
